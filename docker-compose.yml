@@ -1,0 +1,9 @@
+services:
+  sobatproduct:
+    build: .
+    container_name: sobatproduct
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./index.js:/app/index.js
+      - ./google-credentials.json:/app/google-credentials.json:ro

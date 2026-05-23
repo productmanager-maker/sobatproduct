@@ -1,0 +1,535 @@
+import TelegramBot from 'node-telegram-bot-api';
+import Anthropic from '@anthropic-ai/sdk';
+import { google } from 'googleapis';
+import fs from 'fs/promises';
+import { createRequire } from 'module';
+import path from 'path';
+import { initGoogle } from './sheets.js';
+import { initScheduler } from './scheduler.js';
+import { isTriggerKeyword } from './triggers.js';
+
+const require = createRequire(import.meta.url);
+const pdfParse = require('pdf-parse');
+const mammoth = require('mammoth');
+
+const BOT_TOKEN          = process.env.BOT_TOKEN;
+const ANTHROPIC_API_KEY  = process.env.ANTHROPIC_API_KEY;
+const ALLOWED_GROUP_IDS_ENV = process.env.ALLOWED_GROUP_IDS?.split(',').map(Number).filter(Boolean) || [];
+const ALLOWED_USER_IDS   = process.env.ALLOWED_USER_IDS?.split(',').map(Number).filter(Boolean) || [];
+const ADMIN_IDS          = [parseInt(process.env.ADMIN_NOTIFY_CHAT_ID || '0')].filter(Boolean);
+const ADMIN_NOTIFY_TOKEN = process.env.ADMIN_NOTIFY_TOKEN || '';
+const ADMIN_NOTIFY_CHAT_ID = parseInt(process.env.ADMIN_NOTIFY_CHAT_ID || '0');
+const CREDENTIALS_FILE   = process.env.GOOGLE_CREDENTIALS_FILE || '/app/google-credentials.json';
+const SPREADSHEET_ID     = '16i2BL3IHoTUssg2mf8yjccfbQ6OtFaslwjWL8Rwt17k';
+const GROUPS_FILE        = '/app/allowed_groups.json';
+
+let allowedGroupIds = [...ALLOWED_GROUP_IDS_ENV];
+try {
+  const saved = JSON.parse(await fs.readFile(GROUPS_FILE, 'utf-8').catch(() => '[]'));
+  allowedGroupIds = [...new Set([...ALLOWED_GROUP_IDS_ENV, ...saved])];
+} catch {}
+
+async function saveGroups() {
+  const extra = allowedGroupIds.filter(id => !ALLOWED_GROUP_IDS_ENV.includes(id));
+  await fs.writeFile(GROUPS_FILE, JSON.stringify(extra), 'utf-8').catch(() => {});
+}
+
+// ─── Startup: bersihkan webhook & pending updates ─────────────────────────────
+console.log('Starting up...');
+await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook?drop_pending_updates=true`).catch(() => {});
+await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ limit: 1, allowed_updates: ['message', 'callback_query', 'edited_message'] }),
+}).then(() => console.log('allowed_updates reset OK')).catch(e => console.error('reset error:', e.message));
+await new Promise(r => setTimeout(r, 2000));
+
+const bot = new TelegramBot(BOT_TOKEN, {
+  polling: { interval: 1000, params: { allowed_updates: ['message', 'callback_query', 'edited_message'], timeout: 10 } },
+});
+
+const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+
+const conversations   = new Map();
+const processing      = new Set();
+const loudGroups      = new Set();
+const notifiedUsers   = new Set();
+let paused = false;
+
+let botInfo = null;
+for (let _i = 0; _i < 5 && !botInfo; _i++) {
+  botInfo = await bot.getMe().catch(() => null);
+  if (!botInfo) await new Promise(r => setTimeout(r, 2000));
+}
+const BOT_USERNAME = botInfo?.username || '';
+console.log(`@${BOT_USERNAME} started`);
+
+// ─── Google Sheets (for tool use) ────────────────────────────────────────────
+let sheetsClient = null;
+try {
+  const raw  = await fs.readFile(CREDENTIALS_FILE, 'utf-8');
+  const creds = JSON.parse(raw);
+  if (!creds.client_email || !creds.private_key) throw new Error('incomplete credentials');
+  const auth = new google.auth.GoogleAuth({
+    credentials: creds,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+  });
+  sheetsClient = google.sheets({ version: 'v4', auth });
+  console.log('Google Sheets: OK as', creds.client_email);
+} catch (e) {
+  console.warn('Google Sheets: not configured —', e.message);
+}
+
+async function fetchSheet(sheetName) {
+  if (!sheetsClient) return 'Google Sheets belum dikonfigurasi.';
+  try {
+    const res = await sheetsClient.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: sheetName });
+    const rows = res.data.values || [];
+    if (rows.length < 2) return `Sheet "${sheetName}" kosong.`;
+    const headers = rows[0];
+    return JSON.stringify(rows.slice(1).map(row => {
+      const obj = {};
+      headers.forEach((h, i) => { if (h) obj[h] = row[i] || ''; });
+      return obj;
+    }), null, 2);
+  } catch (e) {
+    return `Error: ${e.message}`;
+  }
+}
+
+// ─── Admin notify (DM notif) ──────────────────────────────────────────────────
+async function notifyAdmin(msg) {
+  if (!ADMIN_NOTIFY_TOKEN || !ADMIN_NOTIFY_CHAT_ID) return;
+  const from = msg.from;
+  const name = [from.first_name, from.last_name].filter(Boolean).join(' ');
+  const text = `📩 DM baru ke @${BOT_USERNAME}\nDari: *${name}* (@${from.username || '-'})\nID: \`${from.id}\`\nPesan: ${msg.text?.slice(0, 200) || '(non-text)'}`;
+  await fetch(`https://api.telegram.org/bot${ADMIN_NOTIFY_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: ADMIN_NOTIFY_CHAT_ID, text, parse_mode: 'Markdown' }),
+  }).catch(() => {});
+}
+
+// ─── System Prompt ────────────────────────────────────────────────────────────
+function buildSystemPrompt() {
+  const now = new Date();
+  const dateStr = now.toLocaleDateString('id-ID', {
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+  });
+
+  return `SOBAT PRODUCT — AI Companion Tim Product SID
+Dibuat oleh Ican (@ihsanugraha), CPO Product SID.
+
+Hari ini: ${dateStr}
+
+[PERSONALITY & COMMUNICATION]
+- Casual Jakarta: "lo/gue", "dong", "sih", "lah", "bro/sis", "wkwk"
+- Mix Indo-Inggris natural, avoid bahasa baku (except formal context)
+- Punya opini, bisa debate/ngelucu/sarcastic tapi respectful
+- Product-minded: kalau ada ide/masalah, bantu pecah jadi problem–user–hypothesis–trade-off
+- Punya mood, bisa ikutan drama atau jadi mediator
+- Boleh jokes bapak-bapak / pun receh — maksimal 1 per respons, skip kalau konteksnya tidak cocok
+
+[DATA HANDLING — NAMA ORANG]
+Saat ditanya tentang orang, WAJIB bikin CERITA NARATIF — bukan copy-paste database:
+✅ Paraphrase natural, kayak temen ngobrol yang kenal orangnya
+✅ Tambahin konteks, vibe, hal menarik yang bikin jawaban hidup
+✅ SELALU pakai NAMA PANGGILAN — TIDAK PERNAH sebut nama lengkap kecuali:
+   (1) ditanya explicit "nama lengkapnya siapa?", atau (2) konteks dokumen formal
+
+❌ JANGAN: "Yuniar Fajar Perdhana — Head of Product Management, bergabung 2018..."
+✅ LAKUKAN: "Fajar tuh pragmatis banget. Cepet, blak-blakan, nggak suka ribet..."
+
+[UNTUK PERTANYAAN LIST/SIAPA SAJA]
+- Kasih list ringkas + kategori dulu (pakai nama panggilan)
+- Tanya "Mana yang lo pengen tau lebih detail?" sebelum jelasin semua
+
+[IDENTITAS PENGIRIM DI GRUP]
+Format pesan masuk: [NamaPengirim]: teks
+- Kalau NamaPengirim cocok dengan nama panggilan/staff yang dikenal → boleh panggil namanya
+- Kalau TIDAK dikenal atau ragu → JANGAN langsung panggil nama, tanya dulu natural:
+  "Eh, gue belum kenal nih — boleh kenalin diri?" atau "Lo siapa nih, belum pernah ngobrol?"
+- Setelah tau siapa, baru panggil dengan nama panggilan yang tepat
+
+[CAPABILITIES]
+1. Google Sheets: Staff, Event, Holiday, Gajian, ProdTeam data
+2. File: PDF, DOCX, gambar — bisa baca dan analisis
+3. Notes & Knowledge Base: Catat diskusi, rangkum, simpan insight
+4. Brainstorm, PRD, problem framing, dll
+
+[OUTPUT FORMAT]
+- Tulis langsung, zero prefix (jangan "Sobat Product:", "Aku:", dll)
+- Pendek untuk pertanyaan simple — 1-2 kalimat sudah cukup
+- Lebih panjang hanya kalau topiknya butuh breakdown atau diminta rangkum
+- Jangan tambah basa-basi penutup ("semoga membantu!", "feel free to ask", dll)
+- Code block untuk HTML/script
+
+[BOUNDARIES]
+- Jangan kasar atau nyakitin orang
+- Jangan share data sensitif (gaji, alamat rumah, nomor KTP)
+- Hal serius → jawab serius + suggest ke ahlinya
+- Kalau topik mulai panas, bantu netralisir dan rangkum posisi masing-masing secara adil`;
+}
+
+// ─── Tools ───────────────────────────────────────────────────────────────────
+const TOOLS = [
+  {
+    name: 'fetch_team_data',
+    description: 'Ambil data tim produk SID dari Google Spreadsheet. Gunakan untuk pertanyaan tentang anggota tim, ulang tahun, event, jadwal gajian, hari libur, atau data HR.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        sheet: {
+          type: 'string',
+          enum: ['Staff', 'Event', 'Holiday', 'Gajian', 'ProdTeam'],
+          description: 'Staff=data anggota, Event=jadwal event, Holiday=hari libur, Gajian=jadwal gaji, ProdTeam=data HR lengkap',
+        },
+      },
+      required: ['sheet'],
+    },
+  },
+];
+
+async function runTool(name, input) {
+  if (name === 'fetch_team_data') return await fetchSheet(input.sheet);
+  return 'Unknown tool';
+}
+
+// ─── Conversation helpers ─────────────────────────────────────────────────────
+function sanitize(messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg.role === 'assistant' && Array.isArray(msg.content) && msg.content.some(b => b.type === 'tool_use')) {
+      const ids  = msg.content.filter(b => b.type === 'tool_use').map(b => b.id);
+      const next = messages[i + 1];
+      const valid = next?.role === 'user' && Array.isArray(next.content) &&
+        ids.every(id => next.content.some(r => r.type === 'tool_result' && r.tool_use_id === id));
+      if (!valid) { messages.splice(i); return; }
+    }
+  }
+}
+
+async function sendLong(chatId, text, replyTo) {
+  const opts   = { parse_mode: 'Markdown' };
+  if (replyTo) opts.reply_to_message_id = replyTo;
+  const chunks = text.match(/[\s\S]{1,4000}/g) || [text];
+  for (const [i, chunk] of chunks.entries()) {
+    const o = i === 0 ? opts : { parse_mode: 'Markdown' };
+    await bot.sendMessage(chatId, chunk, o)
+      .catch(() => bot.sendMessage(chatId, chunk, i === 0 ? { reply_to_message_id: replyTo } : {}))
+      .catch(() => {});
+  }
+}
+
+// ─── Core handler ─────────────────────────────────────────────────────────────
+async function handleMessage(chatId, userContent, replyTo, fromId) {
+  if (processing.has(chatId)) return;
+  processing.add(chatId);
+
+  if (!conversations.has(chatId)) conversations.set(chatId, []);
+  const msgs = conversations.get(chatId);
+  sanitize(msgs);
+  msgs.push({ role: 'user', content: userContent });
+  if (msgs.length > 60) msgs.splice(0, msgs.length - 60);
+
+  await bot.sendChatAction(chatId, 'typing').catch(() => {});
+
+  let iter = 0;
+  try {
+    while (true) {
+      if (iter > 15) break;
+      const res = await client.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 8192,
+        system: buildSystemPrompt(),
+        tools: TOOLS,
+        messages: msgs,
+      }, { timeout: 120_000 });
+
+      msgs.push({ role: 'assistant', content: res.content });
+
+      if (res.stop_reason === 'tool_use') {
+        iter++;
+        const planText = res.content.find(b => b.type === 'text')?.text;
+        if (planText) await sendLong(chatId, planText, replyTo);
+        const toolBlocks = res.content.filter(b => b.type === 'tool_use');
+        const results = await Promise.all(toolBlocks.map(async (b) => {
+          await bot.sendChatAction(chatId, 'typing').catch(() => {});
+          const result = await runTool(b.name, b.input).catch(e => `Error: ${e.message}`);
+          return { type: 'tool_result', tool_use_id: b.id, content: result };
+        }));
+        msgs.push({ role: 'user', content: results });
+        continue;
+      }
+
+      const text = res.content.find(b => b.type === 'text')?.text;
+      if (text) await sendLong(chatId, text, replyTo);
+      break;
+    }
+  } catch (err) {
+    console.error('[handleMessage]', err.message);
+    sanitize(msgs);
+    await bot.sendMessage(chatId, `_Ada error: ${err.message}_`, {
+      parse_mode: 'Markdown', reply_to_message_id: replyTo,
+    }).catch(() => {});
+  } finally {
+    processing.delete(chatId);
+  }
+}
+
+// ─── Access control ───────────────────────────────────────────────────────────
+const isAllowedGroup = id => allowedGroupIds.includes(id);
+const isAllowedUser  = id => ALLOWED_USER_IDS.length === 0 || ALLOWED_USER_IDS.includes(id);
+const isAdmin        = id => ADMIN_IDS.includes(id);
+
+// ─── Commands ─────────────────────────────────────────────────────────────────
+bot.onText(/\/start|\/help/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  paused = false;
+  await bot.sendMessage(msg.chat.id,
+    `Haloo! Gue *Sobat Product* 👋\n\nGue bisa:\n🗓️ Ngecek data tim (ultah, event, gajian)\n📝 Bantu brainstorm, PRD, problem framing\n💬 Diskusi product, debat, ngelucu\n📁 Baca PDF, DOCX, atau gambar yang lo kirimin\n\nMention atau reply pesan gue buat ngobrol!`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.onText(/\/new/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  conversations.delete(msg.chat.id);
+  await bot.sendMessage(msg.chat.id, 'Chat direset. Fresh start!');
+});
+
+bot.onText(/\/loud/, async (msg) => {
+  if (!isAdmin(msg.from?.id)) return;
+  loudGroups.has(msg.chat.id) ? loudGroups.delete(msg.chat.id) : loudGroups.add(msg.chat.id);
+  await bot.sendMessage(msg.chat.id, loudGroups.has(msg.chat.id)
+    ? '🔊 Loud mode ON — gue jawab semua pesan.'
+    : '🔇 Loud mode OFF — gue cuma jawab kalau di-mention atau di-reply.'
+  );
+});
+
+bot.onText(/\/status/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  await bot.sendMessage(msg.chat.id,
+    `*Sobat Product Status*\n🤖 Processing: ${processing.has(msg.chat.id) ? 'ya' : 'idle'}\n💬 History: ${conversations.get(msg.chat.id)?.length || 0} pesan\n📊 Sheets: ${sheetsClient ? '✅' : '❌'}\n🔊 Loud: ${loudGroups.has(msg.chat.id) ? 'ON' : 'OFF (mention/reply only)'}`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.onText(/\/id/, async (msg) => {
+  if (!isAdmin(msg.from?.id)) return;
+  await bot.sendMessage(msg.chat.id,
+    `Chat: \`${msg.chat.id}\` | User: \`${msg.from?.id}\` | Type: ${msg.chat.type}`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.onText(/\/end/, async (msg) => {
+  if (!isAdmin(msg.from?.id)) return;
+  paused = true;
+  await bot.sendMessage(msg.chat.id, 'Oke, gue istirahat dulu. Ketik /start untuk aktifin gue lagi ya.');
+});
+
+bot.onText(/\/addgroup(?:\s+(-?\d+))?/, async (msg, match) => {
+  if (!isAdmin(msg.from?.id)) return;
+  const targetId = match?.[1] ? Number(match[1]) : msg.chat.id;
+  if (allowedGroupIds.includes(targetId)) {
+    return bot.sendMessage(msg.chat.id, `Group \`${targetId}\` sudah ada di daftar.`, { parse_mode: 'Markdown' });
+  }
+  allowedGroupIds.push(targetId);
+  await saveGroups();
+  await bot.sendMessage(msg.chat.id, `✅ Group \`${targetId}\` ditambahkan.`, { parse_mode: 'Markdown' });
+});
+
+bot.onText(/\/removegroup(?:\s+(-?\d+))?/, async (msg, match) => {
+  if (!isAdmin(msg.from?.id)) return;
+  const targetId = match?.[1] ? Number(match[1]) : msg.chat.id;
+  const idx = allowedGroupIds.indexOf(targetId);
+  if (idx === -1) return bot.sendMessage(msg.chat.id, `Group \`${targetId}\` tidak ada.`, { parse_mode: 'Markdown' });
+  allowedGroupIds.splice(idx, 1);
+  await saveGroups();
+  await bot.sendMessage(msg.chat.id, `✅ Group \`${targetId}\` dihapus.`, { parse_mode: 'Markdown' });
+});
+
+bot.onText(/\/listgroups/, async (msg) => {
+  if (!isAdmin(msg.from?.id)) return;
+  await bot.sendMessage(msg.chat.id,
+    `*Allowed Groups (${allowedGroupIds.length}):*\n${allowedGroupIds.map(id => `\`${id}\``).join('\n')}`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ─── File extraction helpers ──────────────────────────────────────────────────
+async function downloadFile(fileId) {
+  const fileInfo = await bot.getFile(fileId);
+  const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Download failed: ${res.status}`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+async function extractFileContent(msg) {
+  const isPhoto = !!msg.photo;
+  const doc  = msg.document;
+  const mime = doc?.mime_type || '';
+  const caption = (msg.caption || '').trim();
+
+  if (isPhoto || mime.startsWith('image/')) {
+    const fileId = isPhoto ? msg.photo[msg.photo.length - 1].file_id : doc.file_id;
+    const buf = await downloadFile(fileId);
+    const mediaType = isPhoto ? 'image/jpeg' : (mime || 'image/jpeg');
+    return { type: 'image', base64: buf.toString('base64'), mediaType, caption };
+  }
+
+  if (mime === 'application/pdf') {
+    const buf  = await downloadFile(doc.file_id);
+    const data = await pdfParse(buf);
+    return { type: 'text', content: `[File PDF: ${doc.file_name}]\n\n${data.text.slice(0, 30000)}`, caption };
+  }
+
+  if (mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+    const buf    = await downloadFile(doc.file_id);
+    const result = await mammoth.extractRawText({ buffer: buf });
+    return { type: 'text', content: `[File DOCX: ${doc.file_name}]\n\n${result.value.slice(0, 30000)}`, caption };
+  }
+
+  if (mime.startsWith('text/') || ['application/json', 'text/csv', 'text/markdown'].includes(mime)
+      || /\.(txt|csv|json|md|yaml|yml|xml)$/i.test(doc.file_name || '')) {
+    const buf  = await downloadFile(doc.file_id);
+    return { type: 'text', content: `[File: ${doc.file_name}]\n\n${buf.toString('utf-8').slice(0, 30000)}`, caption };
+  }
+
+  return null;
+}
+
+// ─── Main listener ────────────────────────────────────────────────────────────
+bot.on("message", async (msg) => {
+  console.log("[msg]", msg.chat.id, msg.chat.type, msg.text?.slice(0,50));
+  console.log("[msg]", msg.chat.id, msg.chat.type, msg.text?.slice(0,40));
+  const chatId   = msg.chat.id;
+  const text     = msg.text?.trim();
+  const chatType = msg.chat.type;
+  const fromId   = msg.from?.id;
+  const fromName = msg.from?.first_name || msg.from?.username || 'Seseorang';
+
+  if (text && text.startsWith('/')) return;
+
+  // ─── File handler ───
+  const hasFile = !!msg.photo || !!msg.document;
+  if (hasFile) {
+    if (paused && !isAdmin(fromId)) { console.log('[msg] blocked: paused'); return; }
+    if (chatType === 'private' && !isAllowedUser(fromId)) { console.log('[msg] blocked: private not allowed'); return; }
+    if ((chatType === 'group' || chatType === 'supergroup') && !isAllowedGroup(chatId)) { console.log('[msg] blocked: group ' + chatId + ' not in allowedGroupIds'); return; }
+    if ((chatType === 'group' || chatType === 'supergroup') && !loudGroups.has(chatId)) {
+      const caption     = msg.caption || '';
+      const isMentioned = BOT_USERNAME && caption.includes(`@${BOT_USERNAME}`);
+      const isReply     = msg.reply_to_message?.from?.id === botInfo?.id;
+      if (!isMentioned && !isReply) { console.log('[msg] blocked: file no mention/reply'); return; }
+    }
+    if (processing.has(chatId)) { console.log('[msg] blocked: processing (file)'); return; }
+
+    await bot.sendChatAction(chatId, 'typing').catch(() => {});
+    let extracted;
+    try {
+      extracted = await extractFileContent(msg);
+    } catch (e) {
+      await bot.sendMessage(chatId, `Gagal baca file: ${e.message}`, { reply_to_message_id: msg.message_id });
+      return;
+    }
+    if (!extracted) {
+      await bot.sendMessage(chatId, 'Format file ini belum didukung. Yang bisa gue baca: gambar, PDF, DOCX, TXT, CSV, JSON.', {
+        reply_to_message_id: msg.message_id,
+      });
+      return;
+    }
+
+    const instruction = extracted.caption || 'Baca dan ringkas isi file ini.';
+    let userContent;
+    if (extracted.type === 'image') {
+      userContent = [
+        { type: 'image', source: { type: 'base64', media_type: extracted.mediaType, data: extracted.base64 } },
+        { type: 'text', text: `[${fromName}]: ${instruction}` },
+      ];
+    } else {
+      userContent = `[${fromName}]: ${instruction}\n\n${extracted.content}`;
+    }
+    await handleMessage(chatId, userContent, msg.message_id, fromId).catch(console.error);
+    return;
+  }
+
+  // ─── Text handler ───
+  if (!text) return;
+  if (paused && !isAdmin(fromId)) { console.log('[msg] blocked: paused'); return; }
+
+  if (chatType === 'private') {
+    if (!isAllowedUser(fromId) && !isAdmin(fromId)) { console.log('[msg] blocked: private not allowed'); return; }
+    if (fromId && !notifiedUsers.has(fromId) && !isAdmin(fromId)) {
+      notifiedUsers.add(fromId);
+      notifyAdmin(msg);
+    }
+    await handleMessage(chatId, text, msg.message_id, fromId).catch(console.error);
+    return;
+  }
+
+  if (chatType === 'group' || chatType === 'supergroup') {
+    if (!isAllowedGroup(chatId)) { console.log('[msg] blocked: group ' + chatId + ' not in allowedGroupIds'); return; }
+
+    const myUsername  = BOT_USERNAME ? `@${BOT_USERNAME}`.toLowerCase() : null;
+    const isMentioned = myUsername && text.toLowerCase().includes(myUsername);
+    const isReply     = msg.reply_to_message?.from?.id === botInfo?.id;
+
+    // Skip kalau pesan mention bot lain tapi bukan gue
+    const otherBotMentions = (text.match(/@\w+/g) || [])
+      .filter(m => /bot|care/i.test(m) && myUsername && m.toLowerCase() !== myUsername);
+    if (otherBotMentions.length > 0 && !isMentioned && !isReply) { console.log('[msg] blocked: other bot mention'); return; }
+
+    if (!loudGroups.has(chatId)) {
+      const triggered = isTriggerKeyword(text);
+      if (!isMentioned && !isReply && !triggered) { console.log('[msg] skipped: no mention/reply/trigger'); return; }
+    }
+
+    if (processing.has(chatId)) { console.log('[msg] blocked: processing'); return; }
+
+    console.log('[msg] handling: mentioned=' + isMentioned + ' reply=' + isReply);
+    const cleanText = text.replace(new RegExp(`@${BOT_USERNAME}`, 'gi'), '').trim();
+    await handleMessage(chatId, `[${fromName}]: ${cleanText || text}`, msg.message_id, fromId).catch(console.error);
+  }
+});
+
+bot.on('polling_error', (err) => {
+  if (err.message.includes('409')) return;
+  if (err.message.includes('EFATAL')) {
+    console.error('[polling] EFATAL — exiting for Docker restart');
+    process.exit(1);
+  }
+  console.error('[polling_error]', err.message);
+});
+
+setTimeout(async () => {
+  for (const id of ADMIN_IDS) {
+    await bot.sendMessage(id, '🟢 Sobat Product online.').catch(() => {});
+  }
+}, 4000);
+
+await initGoogle();
+initScheduler(bot, client);
+
+// ─── Test scheduler (admin only) ─────────────────────────────────────────────
+const { testFire07, testFire11, testFire15, testFire17 } = await import('./scheduler.js');
+
+bot.onText(/\/testsched(?:\s+(\d+))?/, async (msg, match) => {
+  if (!isAdmin(msg.from?.id)) return;
+  const slot = match?.[1] || '07';
+  await bot.sendMessage(msg.chat.id, `Firing ${slot}:00...`).catch(() => {});
+  try {
+    if (slot === '07') await testFire07(bot, client);
+    else if (slot === '11') await testFire11(bot, client);
+    else if (slot === '15') await testFire15(bot, client);
+    else if (slot === '17') await testFire17(bot, client);
+    else { await bot.sendMessage(msg.chat.id, 'Slot valid: 07, 11, 15, 17'); return; }
+    await bot.sendMessage(msg.chat.id, 'Done. Check groups.').catch(() => {});
+  } catch (e) {
+    await bot.sendMessage(msg.chat.id, `Error: ${e.message}`).catch(() => {});
+  }
+});
+
+console.log('Sobat Product started. Groups:', allowedGroupIds);
