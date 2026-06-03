@@ -418,7 +418,7 @@ export function getDriveContext() {
 // ── Agama-based filter ────────────────────────────────────────────────────────
 const AGAMA_MAP = {
   islam:    ['islam', 'muslim'],
-  kristen:  ['kristen', 'kristen protestan', 'protestan', 'kristen katolik', 'katolik'],
+  kristen:  ['kristen', 'kristen protestan', 'protestan', 'kristen katolik', 'katolik', 'catholic', 'christian', 'kristiani'],
   hindu:    ['hindu'],
   buddha:   ['buddha', 'budha', 'buddhist'],
   konghucu: ['konghucu', 'kong hu cu', 'confucius'],

@@ -115,6 +115,7 @@ function buildSystemPrompt() {
   const now = new Date();
   const dateStr = now.toLocaleDateString('id-ID', {
     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+    timeZone: 'Asia/Jakarta',
   });
 
   return `SOBAT PRODUCT — AI Companion Tim Product SID

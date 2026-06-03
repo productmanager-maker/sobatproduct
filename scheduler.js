@@ -75,6 +75,36 @@ async function broadcast(bot, text, opts = {}) {
   }
 }
 
+// Kirim pesan tebak-tebakan: bagian soal normal, jawaban sebagai spoiler reply
+async function broadcastWithSpoiler(bot, fullText) {
+  const SEP = '---JAWABAN---';
+  const idx = fullText.indexOf(SEP);
+
+  for (const groupId of SCHEDULE_GROUP_IDS) {
+    if (idx === -1) {
+      await bot.sendMessage(groupId, fullText.trim(), { parse_mode: 'Markdown' })
+        .catch(e => console.error(`[scheduler] send error ${groupId}:`, e.message));
+    } else {
+      const mainPart   = fullText.slice(0, idx).trim();
+      const answerPart = fullText.slice(idx + SEP.length).trim();
+
+      const mainMsg = await bot.sendMessage(groupId, mainPart, { parse_mode: 'Markdown' })
+        .catch(e => { console.error(`[scheduler] send error ${groupId}:`, e.message); return null; });
+
+      if (answerPart && mainMsg) {
+        const htmlAnswer = answerPart
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+          .replace(/\*([^*]+)\*/g, '<b>$1</b>')
+          .replace(/_([^_]+)_/g, '<i>$1</i>');
+        await bot.sendMessage(groupId,
+          `<tg-spoiler>${htmlAnswer}</tg-spoiler>`,
+          { parse_mode: 'HTML', reply_to_message_id: mainMsg.message_id }
+        ).catch(e => console.error(`[scheduler] spoiler error ${groupId}:`, e.message));
+      }
+    }
+  }
+}
+
 
 // ── Rotating content (11:00) ──────────────────────────────────────────────────
 const MORNING_ROTATION = {
@@ -104,13 +134,18 @@ function promptTebakTebakan(ctx) {
   return `Buat satu tebak-tebakan yang relate ke dunia kerja, tech, atau product.
 Harus sedikit lucu, ada twist, bisa dijawab.
 
-Format wajib:
+Output WAJIB dalam 2 bagian dipisah persis "---JAWABAN---":
+
+BAGIAN 1 (soal):
 "Halo gengs! Semoga harimu menyenangkan!
 
 *Tebak-tebakan!*
-[Soal]
+[Soal tebak-tebakan — 2-4 kalimat, jangan bocorkan jawaban]"
 
-Jawaban: [Jawaban]"
+---JAWABAN---
+
+BAGIAN 2 (jawaban — akan disembunyikan sebagai spoiler):
+"Jawaban: [Jawaban] [1 kalimat penjelasan singkat yang menarik]"
 
 Hari ini: ${ctx.date}, ${ctx.dayID}.`;
 }
@@ -140,22 +175,27 @@ function promptTebakOrang(ctx) {
     const m = bday.match(/(\d{1,2})[\/\-](\d{1,2})/);
     if (m) { const mo = months[parseInt(m[2]) - 1]; if (mo) clues.push(`Lahir bulan ${mo}.`); }
   }
-  if (fact) clues.push(`Fun fact: ${fact}`);
+  // fact tidak dimasukkan ke clues — dipakai sebagai konteks narasi jawaban saja
+  const clueText    = clues.slice(0, 4).map((c, i) => `${i + 1}. ${c}`).join('\n');
+  const factContext = fact
+    ? `\n\nKonteks untuk narasi jawaban (JANGAN copy-paste label seperti "Persona:", "Cara Berkomunikasi:", dll — tulis ulang jadi 1-2 kalimat natural kayak temen yang kenal orangnya):\n${fact}`
+    : '';
 
-  const clueText = clues.slice(0, 4).map((c, i) => `${i + 1}. ${c}`).join('\n');
-  return `Buat post tebak-tebakan anggota tim dengan format ini persis:
+  return `Buat post tebak-tebakan anggota tim. Output WAJIB dalam 2 bagian dipisah persis "---JAWABAN---".${factContext}
 
+BAGIAN 1 (soal — tulis persis seperti ini, TIDAK perlu diubah):
 "Halo gengs!
 
 *Siapakah orang ini?*
 
 ${clueText}
 
-Siapa coba? Tebak di kolom reply! Jawaban di bawah
-.
-.
-.
-*Jawabannya: ${nick}!* [Tambah 1 kalimat pujian warm untuk ${nick}.]"
+Siapa coba? Tebak di kolom reply!"
+
+---JAWABAN---
+
+BAGIAN 2 (jawaban spoiler — tulis 1 kalimat narasi warm & natural tentang ${nick}, gabungkan semua konteks di atas):
+"*Jawabannya: ${nick}!* [narasi singkat natural tentang ${nick}]"
 
 Hari ini: ${ctx.date}, ${ctx.dayID}.`;
 }
@@ -284,15 +324,21 @@ function promptHolidayWithMentions(holiday, agamaStaff) {
     return tg ? `@${tg.replace(/^@/, '')}` : nick;
   }).filter(Boolean);
 
-  const mentionLine = mentions.length
-    ? `\nSebutkan nama-nama ini secara personal dalam pesan: ${mentions.join(', ')}`
-    : '';
+  // Mention line dibangun di kode — bukan percaya Claude untuk enumerate nama
+  // Ini mencegah Claude menambah/mengubah daftar nama secara bebas
+  const builtMentionLine = mentions.length
+    ? `Halo tim Product SID! Selamat ${holiday} buat ${mentions.join(', ')} — dan semuanya yang merayakan!`
+    : `Halo tim Product SID! Selamat ${holiday} buat semua yang merayakan!`;
 
   return `Buat pesan selamat hari libur "${holiday}" untuk grup tim Product SID.
-${toneMap[type] || toneMap.umum}${mentionLine}
+${toneMap[type] || toneMap.umum}
 
-Isi: ucapan selamat, ingatkan healing & istirahat beneran, reminder kerja jangan kelewatan (tidak menggurui).
-Format: casual lo/gue, 3-5 kalimat. Hari ini: ${dateID()}.`;
+Gunakan PERSIS baris ini sebagai kalimat pembuka (JANGAN ubah, tambah, atau hapus nama/mention):
+"${builtMentionLine}"
+
+Lanjutkan dengan 2-3 kalimat: ingatkan istirahat beneran, jangan lupa beresin todo list sebelum libur.
+JANGAN tambah mention atau nama orang lain di luar yang sudah ada di baris pembuka.
+Casual lo/gue, tanpa emoji berlebihan. Hari ini: ${dateID()}.`;
 }
 
 function promptPayday07() {
@@ -325,12 +371,15 @@ Format: mulai "*${nick}* ${mention}" lalu 2-3 kalimat anniversary. Hari ini: ${d
 }
 
 async function fire07(bot, client) {
+  const disableHoliday = process.env.DISABLE_HOLIDAY_MSG === 'true';
+  const disablePayday  = process.env.DISABLE_PAYDAY_MSG  === 'true';
+
   const holiday       = getTodayHoliday();
   const payday        = isPaydayToday();
   const birthdays     = getTodayBirthdays();
   const anniversaries = getTodayAnniversaries();
 
-  if (holiday) {
+  if (holiday && !disableHoliday) {
     const holidayType = getHolidayType(holiday);
     const agamaStaff  = holidayType !== 'umum' ? getStaffByAgama(holidayType) : [];
     const text = await generate(promptHolidayWithMentions(holiday, agamaStaff), client);
@@ -338,7 +387,7 @@ async function fire07(bot, client) {
     console.log(`[scheduler 07:00] holiday: ${holiday}, agama mentions: ${agamaStaff.length}`);
   }
 
-  if (payday) {
+  if (payday && !disablePayday) {
     const text = await generate(promptPayday07(), client);
     if (text) await broadcast(bot, text);
     console.log(`[scheduler 07:00] payday`);
@@ -402,7 +451,12 @@ async function fireRotating(bot, client, slot) {
   }
 
   if (!text) return;
-  await broadcast(bot, text);
+  const isTebak = type === 'tebak_orang' || type === 'tebak_tebakan';
+  if (isTebak) {
+    await broadcastWithSpoiler(bot, text);
+  } else {
+    await broadcast(bot, text);
+  }
   console.log(`[scheduler ${slot}] type: ${type} — ${ctx.date}`);
 }
 
@@ -413,9 +467,10 @@ function promptSoreMotivasional(ctx) {
 ${isPaydayToday() ? 'Bonus: hari ini gajian!' : ''}
 
 Tone wajib: casual lo/gue, santai kayak ngobrol di kantor. BUKAN motivasi ceramah.
+JANGAN mulai dengan "Sore gue!" atau "Sore" sebagai kalimat pertama — awkward dan terasa robotic.
 
 Yang harus ada (dalam 1 paragraf, 4-5 kalimat):
-1. "Udah jam 5 nih" — acknowledge waktu pulang dengan santai
+1. Acknowledge waktu pulang dengan santai (variasi: "Udah jam 5 nih", "Oke gengs", "Eh bentar lagi pulang nih", dll)
 2. Waktunya beres-beres laptop / log off
 3. Ingatkan istirahat — dinner bareng orang tersayang, quality time${isFriday ? ', nikmatin weekend' : ''}
 4. 1 kalimat humble tentang impact kerja mereka ke guru dan siswa (bukan ceramah, bukan slogan)
@@ -464,14 +519,22 @@ export function initScheduler(bot, client) {
     return;
   }
 
-  const SLOTS = {
+  const ENABLED_SLOTS_ENV = process.env.ENABLED_SLOTS
+    ? process.env.ENABLED_SLOTS.split(',').map(s => s.trim()).filter(Boolean)
+    : null;
+
+  const ALL_SLOTS = {
     '07:00': (b, c) => fire07(b, c),
     '11:00': (b, c) => fireRotating(b, c, '11:00'),
     '15:00': (b, c) => fireRotating(b, c, '15:00'),
     '17:00': (b, c) => fire17(b, c),
   };
+  const SLOTS = ENABLED_SLOTS_ENV
+    ? Object.fromEntries(Object.entries(ALL_SLOTS).filter(([k]) => ENABLED_SLOTS_ENV.includes(k)))
+    : ALL_SLOTS;
 
-  console.log('[scheduler] Active — groups:', SCHEDULE_GROUP_IDS, '| slots: 07:00, 11:00, 15:00, 17:00 | TZ:', TIMEZONE);
+  const activeSlots = Object.keys(SLOTS).join(', ');
+  console.log('[scheduler] Active — groups:', SCHEDULE_GROUP_IDS, '| slots:', activeSlots, '| TZ:', TIMEZONE);
 
   setInterval(async () => {
     const { hour: h, minute: m } = nowTzParts();
