@@ -21,7 +21,7 @@ export const SCHEDULE_GROUP_IDS = process.env.ALLOWED_GROUP_IDS
   ?.split(',').map(Number).filter(Boolean) || [];
 
 const TIMEZONE = process.env.TIMEZONE || 'Asia/Jakarta';
-const MODEL    = process.env.MODEL || 'claude-sonnet-4-6';
+const MODEL    = process.env.MODEL || 'deepseek-v4-flash';
 
 const firedToday = new Map();
 
@@ -58,13 +58,16 @@ function ctxNow() { return { day: weekdayEN(), dayID: weekdayID(), date: dateID(
 
 // ── Generate via Claude ────────────────────────────────────────────────────────
 async function generate(prompt, client, maxTokens = 600) {
-  const res = await client.messages.create({
+  const res = await client.chat.completions.create({
     model: MODEL,
     max_tokens: maxTokens,
-    system: `Lo adalah Sobat Product, AI companion tim Product SID di Sekolah.mu. Lo tinggal di grup Telegram mereka. Gaya: casual Jakarta, lo/gue, hangat, bisa ngelucu. Jangan terlalu banyak emoji. Jawab langsung sesuai format yang diminta, tanpa meta-commentary atau preamble.`,
-    messages: [{ role: 'user', content: prompt }],
+    thinking: { type: 'disabled' },
+    messages: [
+      { role: 'system', content: 'Lo adalah Sobat Product, AI companion tim Product SID di Sekolah.mu. Lo tinggal di grup Telegram mereka. Gaya: casual Jakarta, lo/gue, hangat, bisa ngelucu. Jangan terlalu banyak emoji. Jawab langsung sesuai format yang diminta, tanpa meta-commentary atau preamble.' },
+      { role: 'user', content: prompt },
+    ],
   });
-  return res.content.find(b => b.type === 'text')?.text?.trim() || '';
+  return res.choices[0].message.content?.trim() || '';
 }
 
 // ── Broadcast helpers ─────────────────────────────────────────────────────────

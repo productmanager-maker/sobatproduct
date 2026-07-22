@@ -1,5 +1,5 @@
 import TelegramBot from 'node-telegram-bot-api';
-import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 import { google } from 'googleapis';
 import fs from 'fs/promises';
 import { createRequire } from 'module';
@@ -7,31 +7,41 @@ import path from 'path';
 import { initGoogle } from './sheets.js';
 import { initScheduler } from './scheduler.js';
 import { isTriggerKeyword } from './triggers.js';
+import { registerSidCoreCommands, handleSidCorePendingReply } from './sidcoreCommands.js';
 
 const require = createRequire(import.meta.url);
 const pdfParse = require('pdf-parse');
 const mammoth = require('mammoth');
+const Database = require('better-sqlite3');
 
 const BOT_TOKEN          = process.env.BOT_TOKEN;
-const ANTHROPIC_API_KEY  = process.env.ANTHROPIC_API_KEY;
+const DEEPSEEK_API_KEY   = process.env.DEEPSEEK_API_KEY;
+const OCR_SERVICE_URL    = process.env.OCR_SERVICE_URL || 'http://ocr-service:3098/ocr';
 const ALLOWED_GROUP_IDS_ENV = process.env.ALLOWED_GROUP_IDS?.split(',').map(Number).filter(Boolean) || [];
 const ALLOWED_USER_IDS   = process.env.ALLOWED_USER_IDS?.split(',').map(Number).filter(Boolean) || [];
 const ADMIN_IDS          = [parseInt(process.env.ADMIN_NOTIFY_CHAT_ID || '0')].filter(Boolean);
+const SID_CORE_ALLOWED_USER_IDS = process.env.SID_CORE_ALLOWED_USER_IDS?.split(',').map(Number).filter(Boolean) || [];
 const ADMIN_NOTIFY_TOKEN = process.env.ADMIN_NOTIFY_TOKEN || '';
 const ADMIN_NOTIFY_CHAT_ID = parseInt(process.env.ADMIN_NOTIFY_CHAT_ID || '0');
 const CREDENTIALS_FILE   = process.env.GOOGLE_CREDENTIALS_FILE || '/app/google-credentials.json';
 const SPREADSHEET_ID     = '16i2BL3IHoTUssg2mf8yjccfbQ6OtFaslwjWL8Rwt17k';
-const GROUPS_FILE        = '/app/allowed_groups.json';
+// ── SQLite for allowed groups ─────────────────────────────────────────────────
+require('fs').mkdirSync('/app/data', { recursive: true });
+const groupsDb = new Database('/app/data/groups.db');
+groupsDb.pragma('journal_mode = WAL');
+groupsDb.exec('CREATE TABLE IF NOT EXISTS allowed_groups (id INTEGER PRIMARY KEY)');
 
 let allowedGroupIds = [...ALLOWED_GROUP_IDS_ENV];
-try {
-  const saved = JSON.parse(await fs.readFile(GROUPS_FILE, 'utf-8').catch(() => '[]'));
+{
+  const saved = groupsDb.prepare('SELECT id FROM allowed_groups').all().map(r => r.id);
   allowedGroupIds = [...new Set([...ALLOWED_GROUP_IDS_ENV, ...saved])];
-} catch {}
+}
 
-async function saveGroups() {
+function saveGroups() {
   const extra = allowedGroupIds.filter(id => !ALLOWED_GROUP_IDS_ENV.includes(id));
-  await fs.writeFile(GROUPS_FILE, JSON.stringify(extra), 'utf-8').catch(() => {});
+  groupsDb.prepare('DELETE FROM allowed_groups').run();
+  const ins = groupsDb.prepare('INSERT OR IGNORE INTO allowed_groups (id) VALUES (?)');
+  groupsDb.transaction(() => extra.forEach(id => ins.run(id)))();
 }
 
 // ─── Startup: bersihkan webhook & pending updates ─────────────────────────────
@@ -48,13 +58,172 @@ const bot = new TelegramBot(BOT_TOKEN, {
   polling: { interval: 1000, params: { allowed_updates: ['message', 'callback_query', 'edited_message'], timeout: 10 } },
 });
 
-const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+const client = new OpenAI({ apiKey: DEEPSEEK_API_KEY, baseURL: 'https://api.deepseek.com', maxRetries: 1, timeout: 60_000 });
 
 const conversations   = new Map();
 const processing      = new Set();
 const loudGroups      = new Set();
 const notifiedUsers   = new Set();
 let paused = false;
+
+// ─── /muv — read-only AI exploration of MUV data ──────────────────────────────
+// Analysis only, no mutation tools — actions live entirely in @letsmuvbot now.
+const MUV_URL = (process.env.MUV_URL || 'https://muv.product-sid.us').replace(/\/$/, '');
+
+function normalizeTgUsername(username = '') {
+  return username.replace(/^@/, '').toLowerCase();
+}
+
+async function muvRequest(path, init = {}) {
+  const res = await fetch(`${MUV_URL}${path}`, {
+    ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      'x-telegram-bot-token': BOT_TOKEN,
+      ...(init.headers || {}),
+    },
+  });
+  return res.json().catch(() => ({ ok: false, status: res.status }));
+}
+
+async function getMuvCommand(type, fromId, username = '', extra = {}) {
+  const params = new URLSearchParams({ type, chatId: String(fromId) });
+  const cleanUsername = normalizeTgUsername(username);
+  if (cleanUsername) params.set('username', cleanUsername);
+  for (const [key, value] of Object.entries(extra)) {
+    if (value !== undefined && value !== null && value !== '') params.set(key, String(value));
+  }
+  return muvRequest(`/api/telegram/command?${params.toString()}`, { method: 'GET' });
+}
+
+const MUV_TOOLS = [
+  { type: 'function', function: {
+    name: 'my_tasks',
+    description: 'Ambil semua card/task yang di-assign ke ORANG YANG LAGI NGOBROL SAMA KAMU SEKARANG (identitasnya udah otomatis diketahui dari sesi Telegram, gak perlu tanya nama). Pakai ini kalau ditanya soal "kerjaan saya", "task saya", "punya saya", dst.',
+    parameters: { type: 'object', properties: {} },
+  } },
+  { type: 'function', function: {
+    name: 'search_cards',
+    description: 'Cari card/task MUV berdasarkan kata kunci di judul atau deskripsi.',
+    parameters: { type: 'object', properties: { q: { type: 'string', description: 'kata kunci pencarian' } }, required: ['q'] },
+  } },
+  { type: 'function', function: {
+    name: 'get_card_detail',
+    description: 'Ambil detail lengkap 1 card (deskripsi, checklist, komentar) pakai cardId dari hasil search_cards.',
+    parameters: { type: 'object', properties: { cardId: { type: 'string' } }, required: ['cardId'] },
+  } },
+  { type: 'function', function: {
+    name: 'search_research',
+    description: 'Cari project riset (Risa) MUV berdasarkan kata kunci nama/objective/background.',
+    parameters: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] },
+  } },
+  { type: 'function', function: {
+    name: 'get_research_project',
+    description: 'Ambil detail lengkap 1 project riset (background, research question, temuan, rekomendasi) pakai projectId dari hasil search_research.',
+    parameters: { type: 'object', properties: { projectId: { type: 'string' } }, required: ['projectId'] },
+  } },
+  { type: 'function', function: {
+    name: 'search_docs',
+    description: 'Cari dokumen MUV berdasarkan judul.',
+    parameters: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] },
+  } },
+  { type: 'function', function: {
+    name: 'get_doc',
+    description: 'Ambil isi lengkap 1 dokumen pakai docId dari hasil search_docs.',
+    parameters: { type: 'object', properties: { docId: { type: 'string' } }, required: ['docId'] },
+  } },
+  { type: 'function', function: {
+    name: 'search_prototypes',
+    description: 'Cari prototype MUV berdasarkan nama, deskripsi, atau tag.',
+    parameters: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] },
+  } },
+  { type: 'function', function: {
+    name: 'search_share',
+    description: 'Cari halaman/file yang di-share (ShareNow) berdasarkan nama.',
+    parameters: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] },
+  } },
+];
+
+const MUV_TOOL_TYPE_OVERRIDES = { my_tasks: 'mytasks' };
+
+async function runMuvTool(name, input, fromId, username) {
+  const validNames = new Set(MUV_TOOLS.map((t) => t.function.name));
+  if (!validNames.has(name)) return JSON.stringify({ error: 'Unknown tool' });
+  const type = MUV_TOOL_TYPE_OVERRIDES[name] ?? name;
+  const res = await getMuvCommand(type, fromId, username, input);
+  return JSON.stringify(res);
+}
+
+function buildMuvSystemPrompt() {
+  return `Kamu asisten eksplorasi data MUV (tool manajemen kerja tim Product SID).
+
+Kamu punya akses tool buat cari & baca: Card/task, Research (Risa), Docs, Prototype, Share.
+
+IDENTITAS: kamu SUDAH TAHU siapa yang lagi ngobrol sama kamu (diresolve otomatis dari sesi Telegram). JANGAN PERNAH nanya "kamu siapa?"/"boleh kasih tahu namanya?". Kalau ditanya APAPUN yang self-referential — "kerjaan saya", "task saya", "punya saya", "siapa saya", "saya siapa", dst — langsung panggil tool my_tasks (TANPA nanya nama dulu). Field "member" di hasilnya (name, email, org) itu identitas si penanya — pakai itu buat jawab pertanyaan identitas, dan field "cards"-nya buat jawab soal task.
+
+ATURAN LAIN:
+- SELALU pakai tool buat jawab, jangan pernah ngarang dari ingatan.
+- Buat pertanyaan umum (bukan soal diri sendiri): search dulu (search_cards/search_research/search_docs/search_prototypes/search_share) buat dapetin ID, baru get detail (get_card_detail/get_research_project/get_doc) kalau butuh isi lengkap.
+- Kalau tool gak nemu apa-apa, bilang terus terang "gak ketemu", jangan dikarang-karang.
+- Sebutin sumbernya di jawaban (nama board/project/dokumen), biar orang bisa cek langsung.
+- Jawab ringkas dan langsung ke inti, bahasa Indonesia casual tapi jelas.
+- Ini cuma buat NANYA/ANALISA — kalau user minta aksi (bikin/pindah/assign/selesain task), bilang pakai @letsmuvbot (/new /move /assign /done dst di sana), jangan coba lakuin sendiri.`;
+}
+
+async function handleMuvQuery(chatId, fromId, username, question, replyTo) {
+  await bot.sendChatAction(chatId, 'typing').catch(() => {});
+
+  const messages = [
+    { role: 'system', content: buildMuvSystemPrompt() },
+    { role: 'user', content: question },
+  ];
+
+  let iter = 0;
+  try {
+    while (iter < 5) {
+      const res = await client.chat.completions.create({
+        model: 'deepseek-v4-flash',
+        max_tokens: 1200,
+        thinking: { type: 'disabled' },
+        messages,
+        tools: MUV_TOOLS,
+      });
+      const message = res.choices[0].message;
+      messages.push(message);
+
+      if (res.choices[0].finish_reason === 'tool_calls') {
+        iter++;
+        for (const tc of message.tool_calls || []) {
+          await bot.sendChatAction(chatId, 'typing').catch(() => {});
+          const result = await runMuvTool(tc.function.name, JSON.parse(tc.function.arguments), fromId, username)
+            .catch((e) => JSON.stringify({ error: e.message }));
+          messages.push({ role: 'tool', tool_call_id: tc.id, content: result });
+        }
+        continue;
+      }
+
+      if (message.content) {
+        await bot.sendMessage(chatId, message.content, { reply_to_message_id: replyTo }).catch(() =>
+          bot.sendMessage(chatId, message.content).catch(() => {})
+        );
+      }
+      break;
+    }
+  } catch (err) {
+    console.error('[muv-query]', err.message);
+    await bot.sendMessage(chatId, `Ada error: ${err.message}`, { reply_to_message_id: replyTo }).catch(() => {});
+  }
+}
+
+bot.onText(/^\/muv(?:@\w+)?\s+([\s\S]+)/, async (msg, match) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  await handleMuvQuery(msg.chat.id, msg.from.id, msg.from?.username, match[1].trim(), msg.message_id);
+});
+
+bot.onText(/^\/muv(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  await bot.sendMessage(msg.chat.id, 'Pakai gini: /muv <pertanyaan>\n\nContoh: /muv ada temuan riset apa soal onboarding?\n\nBuat kerja langsung di MUV (bikin/pindah/assign task, reminder), pakai @letsmuvbot ya.');
+});
 
 let botInfo = null;
 for (let _i = 0; _i < 5 && !botInfo; _i++) {
@@ -175,18 +344,21 @@ Format pesan masuk: [NamaPengirim]: teks
 // ─── Tools ───────────────────────────────────────────────────────────────────
 const TOOLS = [
   {
-    name: 'fetch_team_data',
-    description: 'Ambil data tim produk SID dari Google Spreadsheet. Gunakan untuk pertanyaan tentang anggota tim, ulang tahun, event, jadwal gajian, hari libur, atau data HR.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        sheet: {
-          type: 'string',
-          enum: ['Staff', 'Event', 'Holiday', 'Gajian', 'ProdTeam'],
-          description: 'Staff=data anggota, Event=jadwal event, Holiday=hari libur, Gajian=jadwal gaji, ProdTeam=data HR lengkap',
+    type: 'function',
+    function: {
+      name: 'fetch_team_data',
+      description: 'Ambil data tim produk SID dari Google Spreadsheet. Gunakan untuk pertanyaan tentang anggota tim, ulang tahun, event, jadwal gajian, hari libur, atau data HR.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sheet: {
+            type: 'string',
+            enum: ['Staff', 'Event', 'Holiday', 'Gajian', 'ProdTeam'],
+            description: 'Staff=data anggota, Event=jadwal event, Holiday=hari libur, Gajian=jadwal gaji, ProdTeam=data HR lengkap',
+          },
         },
+        required: ['sheet'],
       },
-      required: ['sheet'],
     },
   },
 ];
@@ -200,11 +372,12 @@ async function runTool(name, input) {
 function sanitize(messages) {
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
-    if (msg.role === 'assistant' && Array.isArray(msg.content) && msg.content.some(b => b.type === 'tool_use')) {
-      const ids  = msg.content.filter(b => b.type === 'tool_use').map(b => b.id);
-      const next = messages[i + 1];
-      const valid = next?.role === 'user' && Array.isArray(next.content) &&
-        ids.every(id => next.content.some(r => r.type === 'tool_result' && r.tool_use_id === id));
+    if (msg.role === 'assistant' && msg.tool_calls?.length > 0) {
+      const ids = msg.tool_calls.map(tc => tc.id);
+      const toolMsgs = messages.slice(i + 1, i + 1 + ids.length);
+      const valid = ids.every((id, idx) =>
+        toolMsgs[idx]?.role === 'tool' && toolMsgs[idx]?.tool_call_id === id
+      );
       if (!valid) { messages.splice(i); return; }
     }
   }
@@ -229,6 +402,7 @@ async function handleMessage(chatId, userContent, replyTo, fromId) {
 
   if (!conversations.has(chatId)) conversations.set(chatId, []);
   const msgs = conversations.get(chatId);
+  if (msgs.length > 8) msgs.splice(0, msgs.length - 8);
   sanitize(msgs);
   msgs.push({ role: 'user', content: userContent });
   if (msgs.length > 60) msgs.splice(0, msgs.length - 60);
@@ -238,33 +412,45 @@ async function handleMessage(chatId, userContent, replyTo, fromId) {
   let iter = 0;
   try {
     while (true) {
-      if (iter > 15) break;
-      const res = await client.messages.create({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 8192,
-        system: buildSystemPrompt(),
-        tools: TOOLS,
-        messages: msgs,
-      }, { timeout: 120_000 });
+      if (iter > 5) break;
+      let res;
+      for (let attempt = 0; attempt < 1; attempt++) {
+        try {
+          res = await client.chat.completions.create({
+            model: 'deepseek-v4-flash',
+            max_tokens: 1200,
+            thinking: { type: 'disabled' },
+            messages: [{ role: 'system', content: buildSystemPrompt() }, ...msgs],
+            tools: TOOLS,
+          });
+          break;
+        } catch (e) {
+          if (false && attempt < 1 && (e.message?.includes('Premature close') || e.message?.includes('fetch failed') || e.code === 'ECONNRESET')) {
+            await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
+            await bot.sendChatAction(chatId, 'typing').catch(() => {});
+            continue;
+          }
+          throw e;
+        }
+      }
 
-      msgs.push({ role: 'assistant', content: res.content });
+      if (res.usage) console.log('[costguard] DeepSeek usage', JSON.stringify({ chatId, model: res.model || 'deepseek-v4-flash', usage: res.usage }));
+      const message = res.choices[0].message;
+      msgs.push(message);
 
-      if (res.stop_reason === 'tool_use') {
+      if (res.choices[0].finish_reason === 'tool_calls') {
         iter++;
-        const planText = res.content.find(b => b.type === 'text')?.text;
-        if (planText) await sendLong(chatId, planText, replyTo);
-        const toolBlocks = res.content.filter(b => b.type === 'tool_use');
-        const results = await Promise.all(toolBlocks.map(async (b) => {
+        if (message.content) await sendLong(chatId, message.content, replyTo);
+        const toolCalls = message.tool_calls || [];
+        for (const tc of toolCalls) {
           await bot.sendChatAction(chatId, 'typing').catch(() => {});
-          const result = await runTool(b.name, b.input).catch(e => `Error: ${e.message}`);
-          return { type: 'tool_result', tool_use_id: b.id, content: result };
-        }));
-        msgs.push({ role: 'user', content: results });
+          const result = await runTool(tc.function.name, JSON.parse(tc.function.arguments)).catch(e => `Error: ${e.message}`);
+          msgs.push({ role: 'tool', tool_call_id: tc.id, content: result });
+        }
         continue;
       }
 
-      const text = res.content.find(b => b.type === 'text')?.text;
-      if (text) await sendLong(chatId, text, replyTo);
+      if (message.content) await sendLong(chatId, message.content, replyTo);
       break;
     }
   } catch (err) {
@@ -282,24 +468,34 @@ async function handleMessage(chatId, userContent, replyTo, fromId) {
 const isAllowedGroup = id => allowedGroupIds.includes(id);
 const isAllowedUser  = id => ALLOWED_USER_IDS.length === 0 || ALLOWED_USER_IDS.includes(id);
 const isAdmin        = id => ADMIN_IDS.includes(id);
+// Kosong = semua orang boleh (sama kayak ALLOWED_USER_IDS) - keputusan tim 2026-07-17.
+// Proteksi tetap ada di level command: DM-only + wajib dry-run + konfirmasi eksplisit sebelum --execute.
+const isSidCoreAllowedUser = id => SID_CORE_ALLOWED_USER_IDS.length === 0
+  || SID_CORE_ALLOWED_USER_IDS.includes(id);
+
+registerSidCoreCommands(bot, { isSidCoreAllowedUser });
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
-bot.onText(/\/start|\/help/, async (msg) => {
+bot.onText(/^\/(start|help)(?:@\w+)?$/, async (msg) => {
   if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
   paused = false;
+  const sidCoreSection = msg.chat.type === 'private'
+    ? `\n\n*SID Core automation* (DM only):\n🧹 /resign <token> — rename akun resign\n🛡️ /role <token> — bikin role dari sheet Role\n✏️ /updateuser <token> — ubah data user (nama/email/telp/verifikasi/kategori/jenis kelamin/tanggal lahir/deskripsi) dari sheet Update Data User\n👥 /updaterole <token> — tambah/ubah peran user ke platform dari sheet Update Data User Role ("Hapus" belum didukung)\n➕ /addprogram <token> — tambah peserta ke Program dari sheet Add User to Program\n🗑️ /removeprogram <token> — hapus peserta dari Program (nunjukin progress dulu) dari sheet Remove User from Program\n🧑‍🏫 /addpic <token> — tambah PIC (Desainer/Fasilitator) ke Program dari sheet Add PIC to Program\n👨‍👩‍👧 /kelompok <token> — kelola Kelompok Program (Tambah/Ubah/Hapus Kelompok, Tambah/Pindah Anggota) dari sheet Manage Kelompok Program\n🔄 /synctemplate <token> — sync daftar fitur terbaru ke tab Template\n📋 /exportroles <token> — export semua role ke sheet\n🏢 /exportorg <token> — export semua organisasi ke sheet\n📖 /exportkelompok <token> — export ID Kelompok (50 program terbaru) ke tab Referensi Kelompok, dipakai lookup sebelum isi Aksi Ubah/Hapus/Tambah/Pindah Anggota\n🏛️ /exportplatform <token> — export daftar organisasi & role tiap platform ke sheet Platform x Org + Role\n🔗 /platformorg <token> — kaitkan/lepas Organisasi dari Platform dari tab Aksi Organisasi\n🔗 /platformrole <token> — kaitkan/lepas Role dari Platform dari tab Aksi Role\n🔍 /checkprogram <token> — cek Nama/Periode/Organisasi/Platform/Status/Peserta dari ID Program di sheet Detail Program, dipakai validasi sebelum /addprogram\nToken diambil dari core.sid.id (F12 → Network → cari request ke api.sid.id → header Authorization)`
+    : '';
   await bot.sendMessage(msg.chat.id,
-    `Haloo! Gue *Sobat Product* 👋\n\nGue bisa:\n🗓️ Ngecek data tim (ultah, event, gajian)\n📝 Bantu brainstorm, PRD, problem framing\n💬 Diskusi product, debat, ngelucu\n📁 Baca PDF, DOCX, atau gambar yang lo kirimin\n\nMention atau reply pesan gue buat ngobrol!`,
+    `Haloo! Gue *Sobat Product* 👋\n\nGue bisa:\n🗓️ Ngecek data tim (ultah, event, gajian)\n📝 Bantu brainstorm, PRD, problem framing\n💬 Diskusi product, debat, ngelucu\n📁 Baca PDF, DOCX, atau gambar yang lo kirimin\n🔍 /muv <pertanyaan> — analisa cepat data MUV\n\n(Kerja langsung di MUV — bikin/pindah/assign task, reminder — sekarang lewat @letsmuvbot ya, biar gak nyampur)${sidCoreSection}\n\nMention atau reply pesan gue buat ngobrol!`,
     { parse_mode: 'Markdown' }
   );
 });
 
-bot.onText(/\/new/, async (msg) => {
+bot.onText(/^\/reset(?:@\w+)?$/, async (msg) => {
   if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
   conversations.delete(msg.chat.id);
   await bot.sendMessage(msg.chat.id, 'Chat direset. Fresh start!');
 });
 
-bot.onText(/\/loud/, async (msg) => {
+
+bot.onText(/^\/loud(?:@\w+)?$/, async (msg) => {
   if (!isAdmin(msg.from?.id)) return;
   loudGroups.has(msg.chat.id) ? loudGroups.delete(msg.chat.id) : loudGroups.add(msg.chat.id);
   await bot.sendMessage(msg.chat.id, loudGroups.has(msg.chat.id)
@@ -308,7 +504,7 @@ bot.onText(/\/loud/, async (msg) => {
   );
 });
 
-bot.onText(/\/status/, async (msg) => {
+bot.onText(/^\/status(?:@\w+)?$/, async (msg) => {
   if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
   await bot.sendMessage(msg.chat.id,
     `*Sobat Product Status*\n🤖 Processing: ${processing.has(msg.chat.id) ? 'ya' : 'idle'}\n💬 History: ${conversations.get(msg.chat.id)?.length || 0} pesan\n📊 Sheets: ${sheetsClient ? '✅' : '❌'}\n🔊 Loud: ${loudGroups.has(msg.chat.id) ? 'ON' : 'OFF (mention/reply only)'}`,
@@ -316,7 +512,7 @@ bot.onText(/\/status/, async (msg) => {
   );
 });
 
-bot.onText(/\/id/, async (msg) => {
+bot.onText(/^\/id(?:@\w+)?$/, async (msg) => {
   if (!isAdmin(msg.from?.id)) return;
   await bot.sendMessage(msg.chat.id,
     `Chat: \`${msg.chat.id}\` | User: \`${msg.from?.id}\` | Type: ${msg.chat.type}`,
@@ -324,40 +520,41 @@ bot.onText(/\/id/, async (msg) => {
   );
 });
 
-bot.onText(/\/end/, async (msg) => {
+bot.onText(/^\/end(?:@\w+)?$/, async (msg) => {
   if (!isAdmin(msg.from?.id)) return;
   paused = true;
   await bot.sendMessage(msg.chat.id, 'Oke, gue istirahat dulu. Ketik /start untuk aktifin gue lagi ya.');
 });
 
-bot.onText(/\/addgroup(?:\s+(-?\d+))?/, async (msg, match) => {
+bot.onText(/^\/addgroup(?:@\w+)?(?:\s+(-?\d+))?$/, async (msg, match) => {
   if (!isAdmin(msg.from?.id)) return;
   const targetId = match?.[1] ? Number(match[1]) : msg.chat.id;
   if (allowedGroupIds.includes(targetId)) {
     return bot.sendMessage(msg.chat.id, `Group \`${targetId}\` sudah ada di daftar.`, { parse_mode: 'Markdown' });
   }
   allowedGroupIds.push(targetId);
-  await saveGroups();
+  saveGroups();
   await bot.sendMessage(msg.chat.id, `✅ Group \`${targetId}\` ditambahkan.`, { parse_mode: 'Markdown' });
 });
 
-bot.onText(/\/removegroup(?:\s+(-?\d+))?/, async (msg, match) => {
+bot.onText(/^\/removegroup(?:@\w+)?(?:\s+(-?\d+))?$/, async (msg, match) => {
   if (!isAdmin(msg.from?.id)) return;
   const targetId = match?.[1] ? Number(match[1]) : msg.chat.id;
   const idx = allowedGroupIds.indexOf(targetId);
   if (idx === -1) return bot.sendMessage(msg.chat.id, `Group \`${targetId}\` tidak ada.`, { parse_mode: 'Markdown' });
   allowedGroupIds.splice(idx, 1);
-  await saveGroups();
+  saveGroups();
   await bot.sendMessage(msg.chat.id, `✅ Group \`${targetId}\` dihapus.`, { parse_mode: 'Markdown' });
 });
 
-bot.onText(/\/listgroups/, async (msg) => {
+bot.onText(/^\/listgroups(?:@\w+)?$/, async (msg) => {
   if (!isAdmin(msg.from?.id)) return;
   await bot.sendMessage(msg.chat.id,
     `*Allowed Groups (${allowedGroupIds.length}):*\n${allowedGroupIds.map(id => `\`${id}\``).join('\n')}`,
     { parse_mode: 'Markdown' }
   );
 });
+
 
 // ─── File extraction helpers ──────────────────────────────────────────────────
 async function downloadFile(fileId) {
@@ -366,6 +563,18 @@ async function downloadFile(fileId) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Download failed: ${res.status}`);
   return Buffer.from(await res.arrayBuffer());
+}
+
+// DeepSeek gak ada vision — gambar dibaca via OCR (ocr-service), hasilnya diperlakukan teks biasa
+async function ocrImage(base64, mediaType) {
+  const res = await fetch(OCR_SERVICE_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': mediaType || 'image/jpeg' },
+    body: Buffer.from(base64, 'base64'),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(`OCR gagal: ${data.error}`);
+  return data.text || '';
 }
 
 async function extractFileContent(msg) {
@@ -384,19 +593,19 @@ async function extractFileContent(msg) {
   if (mime === 'application/pdf') {
     const buf  = await downloadFile(doc.file_id);
     const data = await pdfParse(buf);
-    return { type: 'text', content: `[File PDF: ${doc.file_name}]\n\n${data.text.slice(0, 30000)}`, caption };
+    return { type: 'text', content: `[File PDF: ${doc.file_name}]\n\n${data.text.slice(0, 12000)}`, caption };
   }
 
   if (mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
     const buf    = await downloadFile(doc.file_id);
     const result = await mammoth.extractRawText({ buffer: buf });
-    return { type: 'text', content: `[File DOCX: ${doc.file_name}]\n\n${result.value.slice(0, 30000)}`, caption };
+    return { type: 'text', content: `[File DOCX: ${doc.file_name}]\n\n${result.value.slice(0, 12000)}`, caption };
   }
 
   if (mime.startsWith('text/') || ['application/json', 'text/csv', 'text/markdown'].includes(mime)
       || /\.(txt|csv|json|md|yaml|yml|xml)$/i.test(doc.file_name || '')) {
     const buf  = await downloadFile(doc.file_id);
-    return { type: 'text', content: `[File: ${doc.file_name}]\n\n${buf.toString('utf-8').slice(0, 30000)}`, caption };
+    return { type: 'text', content: `[File: ${doc.file_name}]\n\n${buf.toString('utf-8').slice(0, 12000)}`, caption };
   }
 
   return null;
@@ -413,6 +622,9 @@ bot.on("message", async (msg) => {
   const fromName = msg.from?.first_name || msg.from?.username || 'Seseorang';
 
   if (text && text.startsWith('/')) return;
+
+  // ─── SID Core automation: konfirmasi "ya"/"batal" kalau ada pending dry-run ───
+  if (text && chatType === 'private' && await handleSidCorePendingReply(bot, msg)) return;
 
   // ─── File handler ───
   const hasFile = !!msg.photo || !!msg.document;
@@ -446,10 +658,13 @@ bot.on("message", async (msg) => {
     const instruction = extracted.caption || 'Baca dan ringkas isi file ini.';
     let userContent;
     if (extracted.type === 'image') {
-      userContent = [
-        { type: 'image', source: { type: 'base64', media_type: extracted.mediaType, data: extracted.base64 } },
-        { type: 'text', text: `[${fromName}]: ${instruction}` },
-      ];
+      let ocrText;
+      try { ocrText = await ocrImage(extracted.base64, extracted.mediaType); }
+      catch (e) {
+        await bot.sendMessage(chatId, `Gagal baca gambar: ${e.message}`, { reply_to_message_id: msg.message_id });
+        return;
+      }
+      userContent = `[${fromName}]: ${instruction}\n\n[Gambar — hasil OCR]\n${ocrText.trim() || '(tidak ada teks terbaca)'}`;
     } else {
       userContent = `[${fromName}]: ${instruction}\n\n${extracted.content}`;
     }
@@ -460,6 +675,7 @@ bot.on("message", async (msg) => {
   // ─── Text handler ───
   if (!text) return;
   if (paused && !isAdmin(fromId)) { console.log('[msg] blocked: paused'); return; }
+
 
   if (chatType === 'private') {
     if (!isAllowedUser(fromId) && !isAdmin(fromId)) { console.log('[msg] blocked: private not allowed'); return; }
@@ -512,12 +728,12 @@ setTimeout(async () => {
 }, 4000);
 
 await initGoogle();
-initScheduler(bot, client);
+// initScheduler(bot, client); // dimatikan 2026-07-02 — reminder terjadwal (07/11/15/17:00) udah gak kepake
 
 // ─── Test scheduler (admin only) ─────────────────────────────────────────────
 const { testFire07, testFire11, testFire15, testFire17 } = await import('./scheduler.js');
 
-bot.onText(/\/testsched(?:\s+(\d+))?/, async (msg, match) => {
+bot.onText(/^\/testsched(?:@\w+)?(?:\s+(\d+))?$/, async (msg, match) => {
   if (!isAdmin(msg.from?.id)) return;
   const slot = match?.[1] || '07';
   await bot.sendMessage(msg.chat.id, `Firing ${slot}:00...`).catch(() => {});

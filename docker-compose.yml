@@ -6,4 +6,13 @@ services:
     env_file: .env
     volumes:
       - ./index.js:/app/index.js
+      - ./sidcoreCommands.js:/app/sidcoreCommands.js
       - ./google-credentials.json:/app/google-credentials.json:ro
+      - ./data:/app/data
+      - /home/product/sid-core-automation:/app/sid-core-automation:ro
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true

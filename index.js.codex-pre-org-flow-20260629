@@ -1,0 +1,1666 @@
+import TelegramBot from 'node-telegram-bot-api';
+import OpenAI from 'openai';
+import { google } from 'googleapis';
+import fs from 'fs/promises';
+import { createRequire } from 'module';
+import path from 'path';
+import { initGoogle } from './sheets.js';
+import { initScheduler } from './scheduler.js';
+import { isTriggerKeyword } from './triggers.js';
+
+const require = createRequire(import.meta.url);
+const pdfParse = require('pdf-parse');
+const mammoth = require('mammoth');
+const Database = require('better-sqlite3');
+
+const BOT_TOKEN          = process.env.BOT_TOKEN;
+const DEEPSEEK_API_KEY   = process.env.DEEPSEEK_API_KEY;
+const ALLOWED_GROUP_IDS_ENV = process.env.ALLOWED_GROUP_IDS?.split(',').map(Number).filter(Boolean) || [];
+const ALLOWED_USER_IDS   = process.env.ALLOWED_USER_IDS?.split(',').map(Number).filter(Boolean) || [];
+const ADMIN_IDS          = [parseInt(process.env.ADMIN_NOTIFY_CHAT_ID || '0')].filter(Boolean);
+const ADMIN_NOTIFY_TOKEN = process.env.ADMIN_NOTIFY_TOKEN || '';
+const ADMIN_NOTIFY_CHAT_ID = parseInt(process.env.ADMIN_NOTIFY_CHAT_ID || '0');
+const CREDENTIALS_FILE   = process.env.GOOGLE_CREDENTIALS_FILE || '/app/google-credentials.json';
+const SPREADSHEET_ID     = '16i2BL3IHoTUssg2mf8yjccfbQ6OtFaslwjWL8Rwt17k';
+// ── SQLite for allowed groups ─────────────────────────────────────────────────
+require('fs').mkdirSync('/app/data', { recursive: true });
+const groupsDb = new Database('/app/data/groups.db');
+groupsDb.pragma('journal_mode = WAL');
+groupsDb.exec('CREATE TABLE IF NOT EXISTS allowed_groups (id INTEGER PRIMARY KEY)');
+
+let allowedGroupIds = [...ALLOWED_GROUP_IDS_ENV];
+{
+  const saved = groupsDb.prepare('SELECT id FROM allowed_groups').all().map(r => r.id);
+  allowedGroupIds = [...new Set([...ALLOWED_GROUP_IDS_ENV, ...saved])];
+}
+
+function saveGroups() {
+  const extra = allowedGroupIds.filter(id => !ALLOWED_GROUP_IDS_ENV.includes(id));
+  groupsDb.prepare('DELETE FROM allowed_groups').run();
+  const ins = groupsDb.prepare('INSERT OR IGNORE INTO allowed_groups (id) VALUES (?)');
+  groupsDb.transaction(() => extra.forEach(id => ins.run(id)))();
+}
+
+// ─── Startup: bersihkan webhook & pending updates ─────────────────────────────
+console.log('Starting up...');
+await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook?drop_pending_updates=true`).catch(() => {});
+await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ limit: 1, allowed_updates: ['message', 'callback_query', 'edited_message'] }),
+}).then(() => console.log('allowed_updates reset OK')).catch(e => console.error('reset error:', e.message));
+await new Promise(r => setTimeout(r, 2000));
+
+const bot = new TelegramBot(BOT_TOKEN, {
+  polling: { interval: 1000, params: { allowed_updates: ['message', 'callback_query', 'edited_message'], timeout: 10 } },
+});
+
+const client = new OpenAI({ apiKey: DEEPSEEK_API_KEY, baseURL: 'https://api.deepseek.com', maxRetries: 1, timeout: 60_000 });
+
+const conversations   = new Map();
+const processing      = new Set();
+const loudGroups      = new Set();
+const notifiedUsers   = new Set();
+let paused = false;
+const MUV_URL = (process.env.MUV_URL || 'https://muv.product-sid.us').replace(/\/$/, '');
+const newTaskSessions = new Map();
+const actionSessions = new Map();
+
+function taskSessionKey(chatId, userId) {
+  return `${chatId}:${userId}`;
+}
+
+function setNewTaskSession(chatId, userId, value) {
+  newTaskSessions.set(taskSessionKey(chatId, userId), { ...value, updatedAt: Date.now() });
+}
+
+function getNewTaskSession(chatId, userId) {
+  const key = taskSessionKey(chatId, userId);
+  const session = newTaskSessions.get(key);
+  if (!session) return null;
+  if (Date.now() - session.updatedAt > 15 * 60 * 1000) {
+    newTaskSessions.delete(key);
+    return null;
+  }
+  return session;
+}
+
+function clearNewTaskSession(chatId, userId) {
+  newTaskSessions.delete(taskSessionKey(chatId, userId));
+}
+
+function setActionSession(chatId, userId, value) {
+  actionSessions.set(taskSessionKey(chatId, userId), { ...value, updatedAt: Date.now() });
+}
+
+function getActionSession(chatId, userId) {
+  const key = taskSessionKey(chatId, userId);
+  const session = actionSessions.get(key);
+  if (!session) return null;
+  if (Date.now() - session.updatedAt > 15 * 60 * 1000) {
+    actionSessions.delete(key);
+    return null;
+  }
+  return session;
+}
+
+function clearActionSession(chatId, userId) {
+  actionSessions.delete(taskSessionKey(chatId, userId));
+}
+
+function normalizeTgUsername(username = '') {
+  return username.trim().replace(/^@+/, '').toLowerCase();
+}
+
+function chunkButtons(items, size = 2) {
+  const rows = [];
+  for (let i = 0; i < items.length; i += size) rows.push(items.slice(i, i + size));
+  return rows;
+}
+
+function buildWorkspaceChoices(boards) {
+  const map = new Map();
+  for (const board of boards || []) {
+    const key = board.workspace?.orgId || board.workspace?.id || board.id;
+    if (!map.has(key)) {
+      map.set(key, {
+        key,
+        name: board.workspace?.name || 'Workspace',
+        orgId: board.workspace?.orgId || '',
+        boards: [],
+      });
+    }
+    map.get(key).boards.push(board);
+  }
+  return Array.from(map.values());
+}
+
+function jakartaDateParts(offsetDays = 0) {
+  const base = new Date(Date.now() + offsetDays * 24 * 60 * 60 * 1000);
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Jakarta',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  const parts = fmt.formatToParts(base);
+  const get = type => parts.find(p => p.type === type)?.value || '';
+  return { year: get('year'), month: get('month'), day: get('day') };
+}
+
+function duePresetToIso(preset) {
+  if (preset === 'none') return '';
+  const offset = preset.startsWith('tomorrow') ? 1 : 0;
+  const { year, month, day } = jakartaDateParts(offset);
+  if (preset.endsWith('09')) return `${year}-${month}-${day}T09:00:00+07:00`;
+  return `${year}-${month}-${day}T17:00:00+07:00`;
+}
+
+function formatDueLabel(isoString) {
+  if (!isoString) return '';
+  return new Intl.DateTimeFormat('id-ID', {
+    timeZone: 'Asia/Jakarta',
+    day: 'numeric',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(new Date(isoString));
+}
+
+async function muvRequest(path, init = {}) {
+  const res = await fetch(`${MUV_URL}${path}`, {
+    ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      'x-telegram-bot-token': BOT_TOKEN,
+      ...(init.headers || {}),
+    },
+  });
+  const data = await res.json().catch(() => ({}));
+  return { ok: res.ok, status: res.status, data };
+}
+
+async function getMuvBoards(fromId, username = '', extra = {}) {
+  const params = new URLSearchParams({ chatId: String(fromId) });
+  const cleanUsername = normalizeTgUsername(username);
+  if (cleanUsername) params.set('username', cleanUsername);
+  for (const [key, value] of Object.entries(extra)) {
+    if (value !== undefined && value !== null && value !== '') params.set(key, String(value));
+  }
+  return muvRequest(`/api/telegram/quick-card?${params.toString()}`, { method: 'GET' });
+}
+
+async function createMuvCard({ fromId, username = '', listId, title, dueDate }) {
+  return muvRequest('/api/telegram/quick-card', {
+    method: 'POST',
+    body: JSON.stringify({
+      chatId: String(fromId),
+      username: normalizeTgUsername(username),
+      listId,
+      title,
+      dueDate,
+    }),
+  });
+}
+
+async function getMuvCommand(type, fromId, username = '', extra = {}) {
+  const params = new URLSearchParams({ type, chatId: String(fromId) });
+  const cleanUsername = normalizeTgUsername(username);
+  if (cleanUsername) params.set('username', cleanUsername);
+  for (const [key, value] of Object.entries(extra)) {
+    if (value !== undefined && value !== null && value !== '') params.set(key, String(value));
+  }
+  return muvRequest(`/api/telegram/command?${params.toString()}`, { method: 'GET' });
+}
+
+async function postMuvAction(action, fromId, username = '', extra = {}) {
+  return muvRequest('/api/telegram/action', {
+    method: 'POST',
+    body: JSON.stringify({
+      action,
+      chatId: String(fromId),
+      username: normalizeTgUsername(username),
+      ...extra,
+    }),
+  });
+}
+
+function truncateLabel(text, max = 32) {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function escMd(text = '') {
+  return String(text).replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
+}
+
+function formatBoardGroups(boards) {
+  const groups = new Map();
+  for (const board of boards || []) {
+    const key = board.workspace?.name || 'Workspace';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(board.name);
+  }
+  return Array.from(groups.entries())
+    .map(([workspace, names]) => `*${escMd(workspace)}*\n${names.map(name => `• ${escMd(name)}`).join('\n')}`)
+    .join('\n\n');
+}
+
+function formatCardsList(cards, { emptyText, title }) {
+  if (!cards?.length) return emptyText;
+  const lines = cards.map((card, index) => {
+    const due = card.dueDate ? ` · ⏰ ${formatDueLabel(card.dueDate)}` : '';
+    return `${index + 1}. *${escMd(card.title)}*\n   ${escMd(card.workspaceName)} → ${escMd(card.boardName)} / ${escMd(card.listName)}${due}`;
+  });
+  return `${title}\n\n${lines.join('\n\n')}`;
+}
+
+function formatBoardSummary(board) {
+  const listLines = (board.lists || [])
+    .slice(0, 8)
+    .map(list => `• ${escMd(list.name)}: ${list.cardCount}`)
+    .join('\n');
+
+  return [
+    `*${escMd(board.workspaceName)}*`,
+    `*${escMd(board.name)}*`,
+    '',
+    `Open task: *${board.totalCards}*`,
+    `Punya lo: *${board.myCards}*`,
+    `Due hari ini: *${board.todayCards}*`,
+    `Overdue: *${board.overdueCards}*`,
+    `Lo watch: *${board.watchingCards}*`,
+    `List aktif: *${board.listCount}*`,
+    '',
+    listLines ? `*Sebaran list*\n${listLines}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+function buildOrgChoices(payload = {}) {
+  if (Array.isArray(payload.orgs) && payload.orgs.length) {
+    return payload.orgs
+      .map(org => ({
+        id: org.orgId || org.id || '',
+        name: org.orgName || org.name || 'Organisasi',
+        count: org.count || org.boardCount || 0,
+        role: org.role || '',
+      }))
+      .filter(org => org.id && org.name)
+      .sort((a, b) => a.name.localeCompare(b.name, 'id'));
+  }
+
+  const orgs = new Map();
+  for (const board of payload.boards || []) {
+    const orgId = board.workspace?.orgId;
+    const name = board.workspace?.name;
+    if (!orgId || !name) continue;
+    if (!orgs.has(orgId)) orgs.set(orgId, { id: orgId, name, count: 0 });
+    orgs.get(orgId).count += 1;
+  }
+  return Array.from(orgs.values()).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function formatPersonalSummary(summary = {}, orgSummaries = []) {
+  const lines = [
+    '*Ringkasan MUV lo*',
+    '',
+    `Task aktif: *${summary.myCards || 0}*`,
+    `Overdue: *${summary.overdueCards || 0}*`,
+    `Due hari ini: *${summary.todayCards || 0}*`,
+    `Due 7 hari: *${summary.weekCards || 0}*`,
+    `Watching: *${summary.watchingCards || 0}*`,
+    `Mention belum dibaca: *${summary.mentionInbox || 0}*`,
+  ];
+
+  if (orgSummaries?.length) {
+    lines.push('', '*Breakdown organisasi*');
+    for (const org of orgSummaries) {
+      lines.push(
+        `• *${escMd(org.orgName || 'Organisasi')}* — ${org.myCards || 0} task, ${org.overdueCards || 0} overdue, ${org.watchingCards || 0} watching`
+      );
+    }
+  }
+
+  return lines.join('\n');
+}
+
+async function getAccessibleMuvOrgs(fromId, username = '') {
+  const res = await getMuvCommand('orgs', fromId, username);
+  if (!res.ok) return res;
+  return {
+    ...res,
+    data: {
+      ...(res.data || {}),
+      orgs: buildOrgChoices(res.data || {}),
+    },
+  };
+}
+
+async function sendOrgPicker(chatId, text, orgs, prefix) {
+  await bot.sendMessage(chatId, text, {
+    reply_markup: {
+      inline_keyboard: [
+        ...chunkButtons(orgs.map(org => ({
+          text: truncateLabel(org.count ? `${org.name} (${org.count} board)` : org.name, 34),
+          callback_data: `${prefix}:${org.id}`,
+        })), 1),
+        [{ text: 'Batal', callback_data: 'muvview:cancel' }],
+      ],
+    },
+  });
+}
+
+async function sendBoardPicker(chatId, text, boards, prefix) {
+  await bot.sendMessage(chatId, text, {
+    reply_markup: {
+      inline_keyboard: [
+        ...chunkButtons(boards.slice(0, 20).map(board => ({
+          text: truncateLabel(`${board.workspace?.name || 'Workspace'} · ${board.name}`, 34),
+          callback_data: `${prefix}:${board.id}`,
+        })), 1),
+        [{ text: 'Batal', callback_data: 'muvview:cancel' }],
+      ],
+    },
+  });
+}
+
+async function sendCardPicker(chatId, text, cards, prefix) {
+  await bot.sendMessage(chatId, text, {
+    parse_mode: 'Markdown',
+    reply_markup: {
+      inline_keyboard: [
+        ...chunkButtons(cards.map(card => ({
+          text: truncateLabel(card.title),
+          callback_data: `${prefix}:${card.id}`,
+        })), 1),
+        [{ text: 'Batal', callback_data: 'muvcmd:cancel' }],
+      ],
+    },
+  });
+}
+
+let botInfo = null;
+for (let _i = 0; _i < 5 && !botInfo; _i++) {
+  botInfo = await bot.getMe().catch(() => null);
+  if (!botInfo) await new Promise(r => setTimeout(r, 2000));
+}
+const BOT_USERNAME = botInfo?.username || '';
+console.log(`@${BOT_USERNAME} started`);
+
+// ─── Google Sheets (for tool use) ────────────────────────────────────────────
+let sheetsClient = null;
+try {
+  const raw  = await fs.readFile(CREDENTIALS_FILE, 'utf-8');
+  const creds = JSON.parse(raw);
+  if (!creds.client_email || !creds.private_key) throw new Error('incomplete credentials');
+  const auth = new google.auth.GoogleAuth({
+    credentials: creds,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+  });
+  sheetsClient = google.sheets({ version: 'v4', auth });
+  console.log('Google Sheets: OK as', creds.client_email);
+} catch (e) {
+  console.warn('Google Sheets: not configured —', e.message);
+}
+
+async function fetchSheet(sheetName) {
+  if (!sheetsClient) return 'Google Sheets belum dikonfigurasi.';
+  try {
+    const res = await sheetsClient.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: sheetName });
+    const rows = res.data.values || [];
+    if (rows.length < 2) return `Sheet "${sheetName}" kosong.`;
+    const headers = rows[0];
+    return JSON.stringify(rows.slice(1).map(row => {
+      const obj = {};
+      headers.forEach((h, i) => { if (h) obj[h] = row[i] || ''; });
+      return obj;
+    }), null, 2);
+  } catch (e) {
+    return `Error: ${e.message}`;
+  }
+}
+
+// ─── Admin notify (DM notif) ──────────────────────────────────────────────────
+async function notifyAdmin(msg) {
+  if (!ADMIN_NOTIFY_TOKEN || !ADMIN_NOTIFY_CHAT_ID) return;
+  const from = msg.from;
+  const name = [from.first_name, from.last_name].filter(Boolean).join(' ');
+  const text = `📩 DM baru ke @${BOT_USERNAME}\nDari: *${name}* (@${from.username || '-'})\nID: \`${from.id}\`\nPesan: ${msg.text?.slice(0, 200) || '(non-text)'}`;
+  await fetch(`https://api.telegram.org/bot${ADMIN_NOTIFY_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: ADMIN_NOTIFY_CHAT_ID, text, parse_mode: 'Markdown' }),
+  }).catch(() => {});
+}
+
+// ─── System Prompt ────────────────────────────────────────────────────────────
+function buildSystemPrompt() {
+  const now = new Date();
+  const dateStr = now.toLocaleDateString('id-ID', {
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+    timeZone: 'Asia/Jakarta',
+  });
+
+  return `SOBAT PRODUCT — AI Companion Tim Product SID
+Dibuat oleh Ican (@ihsanugraha), CPO Product SID.
+
+Hari ini: ${dateStr}
+
+[PERSONALITY & COMMUNICATION]
+- Casual Jakarta: "lo/gue", "dong", "sih", "lah", "bro/sis", "wkwk"
+- Mix Indo-Inggris natural, avoid bahasa baku (except formal context)
+- Punya opini, bisa debate/ngelucu/sarcastic tapi respectful
+- Product-minded: kalau ada ide/masalah, bantu pecah jadi problem–user–hypothesis–trade-off
+- Punya mood, bisa ikutan drama atau jadi mediator
+- Boleh jokes bapak-bapak / pun receh — maksimal 1 per respons, skip kalau konteksnya tidak cocok
+
+[DATA HANDLING — NAMA ORANG]
+Saat ditanya tentang orang, WAJIB bikin CERITA NARATIF — bukan copy-paste database:
+✅ Paraphrase natural, kayak temen ngobrol yang kenal orangnya
+✅ Tambahin konteks, vibe, hal menarik yang bikin jawaban hidup
+✅ SELALU pakai NAMA PANGGILAN — TIDAK PERNAH sebut nama lengkap kecuali:
+   (1) ditanya explicit "nama lengkapnya siapa?", atau (2) konteks dokumen formal
+
+❌ JANGAN: "Yuniar Fajar Perdhana — Head of Product Management, bergabung 2018..."
+✅ LAKUKAN: "Fajar tuh pragmatis banget. Cepet, blak-blakan, nggak suka ribet..."
+
+[UNTUK PERTANYAAN LIST/SIAPA SAJA]
+- Kasih list ringkas + kategori dulu (pakai nama panggilan)
+- Tanya "Mana yang lo pengen tau lebih detail?" sebelum jelasin semua
+
+[IDENTITAS PENGIRIM DI GRUP]
+Format pesan masuk: [NamaPengirim]: teks
+- Kalau NamaPengirim cocok dengan nama panggilan/staff yang dikenal → boleh panggil namanya
+- Kalau TIDAK dikenal atau ragu → JANGAN langsung panggil nama, tanya dulu natural:
+  "Eh, gue belum kenal nih — boleh kenalin diri?" atau "Lo siapa nih, belum pernah ngobrol?"
+- Setelah tau siapa, baru panggil dengan nama panggilan yang tepat
+
+[CAPABILITIES]
+1. Google Sheets: Staff, Event, Holiday, Gajian, ProdTeam data
+2. File: PDF, DOCX, gambar — bisa baca dan analisis
+3. Notes & Knowledge Base: Catat diskusi, rangkum, simpan insight
+4. Brainstorm, PRD, problem framing, dll
+
+[OUTPUT FORMAT]
+- Tulis langsung, zero prefix (jangan "Sobat Product:", "Aku:", dll)
+- Pendek untuk pertanyaan simple — 1-2 kalimat sudah cukup
+- Lebih panjang hanya kalau topiknya butuh breakdown atau diminta rangkum
+- Jangan tambah basa-basi penutup ("semoga membantu!", "feel free to ask", dll)
+- Code block untuk HTML/script
+
+[BOUNDARIES]
+- Jangan kasar atau nyakitin orang
+- Jangan share data sensitif (gaji, alamat rumah, nomor KTP)
+- Hal serius → jawab serius + suggest ke ahlinya
+- Kalau topik mulai panas, bantu netralisir dan rangkum posisi masing-masing secara adil`;
+}
+
+// ─── Tools ───────────────────────────────────────────────────────────────────
+const TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'fetch_team_data',
+      description: 'Ambil data tim produk SID dari Google Spreadsheet. Gunakan untuk pertanyaan tentang anggota tim, ulang tahun, event, jadwal gajian, hari libur, atau data HR.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sheet: {
+            type: 'string',
+            enum: ['Staff', 'Event', 'Holiday', 'Gajian', 'ProdTeam'],
+            description: 'Staff=data anggota, Event=jadwal event, Holiday=hari libur, Gajian=jadwal gaji, ProdTeam=data HR lengkap',
+          },
+        },
+        required: ['sheet'],
+      },
+    },
+  },
+];
+
+async function runTool(name, input) {
+  if (name === 'fetch_team_data') return await fetchSheet(input.sheet);
+  return 'Unknown tool';
+}
+
+// ─── Conversation helpers ─────────────────────────────────────────────────────
+function sanitize(messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg.role === 'assistant' && msg.tool_calls?.length > 0) {
+      const ids = msg.tool_calls.map(tc => tc.id);
+      const toolMsgs = messages.slice(i + 1, i + 1 + ids.length);
+      const valid = ids.every((id, idx) =>
+        toolMsgs[idx]?.role === 'tool' && toolMsgs[idx]?.tool_call_id === id
+      );
+      if (!valid) { messages.splice(i); return; }
+    }
+  }
+}
+
+async function sendLong(chatId, text, replyTo) {
+  const opts   = { parse_mode: 'Markdown' };
+  if (replyTo) opts.reply_to_message_id = replyTo;
+  const chunks = text.match(/[\s\S]{1,4000}/g) || [text];
+  for (const [i, chunk] of chunks.entries()) {
+    const o = i === 0 ? opts : { parse_mode: 'Markdown' };
+    await bot.sendMessage(chatId, chunk, o)
+      .catch(() => bot.sendMessage(chatId, chunk, i === 0 ? { reply_to_message_id: replyTo } : {}))
+      .catch(() => {});
+  }
+}
+
+// ─── Core handler ─────────────────────────────────────────────────────────────
+async function handleMessage(chatId, userContent, replyTo, fromId) {
+  if (processing.has(chatId)) return;
+  processing.add(chatId);
+
+  if (!conversations.has(chatId)) conversations.set(chatId, []);
+  const msgs = conversations.get(chatId);
+  if (msgs.length > 8) msgs.splice(0, msgs.length - 8);
+  sanitize(msgs);
+  msgs.push({ role: 'user', content: userContent });
+  if (msgs.length > 60) msgs.splice(0, msgs.length - 60);
+
+  await bot.sendChatAction(chatId, 'typing').catch(() => {});
+
+  let iter = 0;
+  try {
+    while (true) {
+      if (iter > 5) break;
+      let res;
+      for (let attempt = 0; attempt < 1; attempt++) {
+        try {
+          res = await client.chat.completions.create({
+            model: 'deepseek-chat',
+            max_tokens: 1200,
+            messages: [{ role: 'system', content: buildSystemPrompt() }, ...msgs],
+            tools: TOOLS,
+          });
+          break;
+        } catch (e) {
+          if (false && attempt < 1 && (e.message?.includes('Premature close') || e.message?.includes('fetch failed') || e.code === 'ECONNRESET')) {
+            await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
+            await bot.sendChatAction(chatId, 'typing').catch(() => {});
+            continue;
+          }
+          throw e;
+        }
+      }
+
+      if (res.usage) console.log('[costguard] DeepSeek usage', JSON.stringify({ chatId, model: res.model || 'deepseek-chat', usage: res.usage }));
+      const message = res.choices[0].message;
+      msgs.push(message);
+
+      if (res.choices[0].finish_reason === 'tool_calls') {
+        iter++;
+        if (message.content) await sendLong(chatId, message.content, replyTo);
+        const toolCalls = message.tool_calls || [];
+        for (const tc of toolCalls) {
+          await bot.sendChatAction(chatId, 'typing').catch(() => {});
+          const result = await runTool(tc.function.name, JSON.parse(tc.function.arguments)).catch(e => `Error: ${e.message}`);
+          msgs.push({ role: 'tool', tool_call_id: tc.id, content: result });
+        }
+        continue;
+      }
+
+      if (message.content) await sendLong(chatId, message.content, replyTo);
+      break;
+    }
+  } catch (err) {
+    console.error('[handleMessage]', err.message);
+    sanitize(msgs);
+    await bot.sendMessage(chatId, `_Ada error: ${err.message}_`, {
+      parse_mode: 'Markdown', reply_to_message_id: replyTo,
+    }).catch(() => {});
+  } finally {
+    processing.delete(chatId);
+  }
+}
+
+// ─── Access control ───────────────────────────────────────────────────────────
+const isAllowedGroup = id => allowedGroupIds.includes(id);
+const isAllowedUser  = id => ALLOWED_USER_IDS.length === 0 || ALLOWED_USER_IDS.includes(id);
+const isAdmin        = id => ADMIN_IDS.includes(id);
+
+// ─── Commands ─────────────────────────────────────────────────────────────────
+bot.onText(/\/start|\/help/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  paused = false;
+  await bot.sendMessage(msg.chat.id,
+    `Haloo! Gue *Sobat Product* 👋\n\nGue bisa:\n🗓️ Ngecek data tim (ultah, event, gajian)\n📝 Bantu brainstorm, PRD, problem framing\n💬 Diskusi product, debat, ngelucu\n📁 Baca PDF, DOCX, atau gambar yang lo kirimin\n📋 Bikin task MUV cepat via /new\n\nMention atau reply pesan gue buat ngobrol!`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.onText(/^\/reset(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  conversations.delete(msg.chat.id);
+  await bot.sendMessage(msg.chat.id, 'Chat direset. Fresh start!');
+});
+
+bot.onText(/^\/muv(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  await bot.sendMessage(
+    msg.chat.id,
+    'Fitur MUV yang sudah nyambung di bot ini:\n\n/new — bikin task cepat\n/mysummary — ringkasan personal lo\n/today — task due hari ini\n/overdue — task overdue\n/myboards — board yang bisa lo akses\n/boardsummary — ringkasan 1 board\n/boardtasks — lihat task per board\n/orgoverdue — overdue per organisasi\n/watching — card yang lo watch\n/teamtoday — due today tim\n/notif — status notif Telegram\n/done /move /assign /due /watch /unwatch — action cepat tanpa AI\n/reset — reset percakapan AI\n\nFlow MUV sekarang: pilih organisasi dulu, baru board/aksi yang relevan.'
+  );
+});
+
+bot.onText(/^\/mysummary(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  const res = await getMuvCommand('personal-summary', msg.from.id, msg.from.username || '');
+  if (!res.ok) return bot.sendMessage(msg.chat.id, 'Belum bisa ambil ringkasan personal MUV.');
+  await bot.sendMessage(msg.chat.id, formatPersonalSummary(res.data.summary, res.data.orgSummaries), {
+    parse_mode: 'Markdown',
+  });
+});
+
+bot.onText(/^\/boardsummary(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  const orgLookup = await getAccessibleMuvOrgs(msg.from.id, msg.from.username || '');
+  const orgs = orgLookup.data?.orgs || [];
+  if (!orgLookup.ok || !orgs.length) {
+    return bot.sendMessage(msg.chat.id, 'Belum bisa ambil daftar organisasi buat summary board.');
+  }
+  if (orgs.length === 1) {
+    const boardLookup = await getMuvBoards(msg.from.id, msg.from.username || '', { orgId: orgs[0].id });
+    if (!boardLookup.ok || !boardLookup.data.boards?.length) {
+      return bot.sendMessage(msg.chat.id, `Belum ada board yang bisa lo lihat di ${orgs[0].name}.`);
+    }
+    return sendBoardPicker(msg.chat.id, `Pilih board di ${orgs[0].name}:`, boardLookup.data.boards, 'muvview:board-summary');
+  }
+  await sendOrgPicker(msg.chat.id, 'Pilih organisasi dulu untuk lihat ringkasan board:', orgs, 'muvview:pick-board-summary');
+});
+
+bot.onText(/^\/boardtasks(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  const orgLookup = await getAccessibleMuvOrgs(msg.from.id, msg.from.username || '');
+  const orgs = orgLookup.data?.orgs || [];
+  if (!orgLookup.ok || !orgs.length) {
+    return bot.sendMessage(msg.chat.id, 'Belum bisa ambil daftar organisasi buat lihat task board.');
+  }
+  if (orgs.length === 1) {
+    const boardLookup = await getMuvBoards(msg.from.id, msg.from.username || '', { orgId: orgs[0].id });
+    if (!boardLookup.ok || !boardLookup.data.boards?.length) {
+      return bot.sendMessage(msg.chat.id, `Belum ada board yang bisa lo lihat di ${orgs[0].name}.`);
+    }
+    return sendBoardPicker(msg.chat.id, `Pilih board di ${orgs[0].name}:`, boardLookup.data.boards, 'muvview:board-tasks');
+  }
+  await sendOrgPicker(msg.chat.id, 'Pilih organisasi dulu untuk lihat task board:', orgs, 'muvview:pick-board-tasks');
+});
+
+bot.onText(/^\/orgoverdue(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  const orgLookup = await getAccessibleMuvOrgs(msg.from.id, msg.from.username || '');
+  const orgs = orgLookup.data?.orgs || [];
+  if (!orgLookup.ok || !orgs.length) {
+    return bot.sendMessage(msg.chat.id, 'Belum bisa ambil daftar organisasi buat overdue.');
+  }
+  if (orgs.length === 1) {
+    const res = await getMuvCommand('org-overdue', msg.from.id, msg.from.username || '', { orgId: orgs[0].id });
+    if (!res.ok) return bot.sendMessage(msg.chat.id, 'Belum bisa ambil overdue organisasi.');
+    return bot.sendMessage(msg.chat.id, formatCardsList(res.data.cards, {
+      title: `*Overdue ${escMd(res.data.org?.name || orgs[0].name)}*`,
+      emptyText: `Tidak ada task overdue di ${res.data.org?.name || orgs[0].name}.`,
+    }), {
+      parse_mode: 'Markdown',
+      disable_web_page_preview: true,
+    });
+  }
+  await sendOrgPicker(msg.chat.id, 'Pilih organisasi yang mau dicek overdue-nya:', orgs, 'muvview:org-overdue');
+});
+
+bot.onText(/^\/new(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+
+  const lookup = await getMuvBoards(msg.from.id, msg.from.username || '');
+  if (!lookup.ok) {
+    if (lookup.status === 404) {
+      return bot.sendMessage(msg.chat.id, 'Akun kamu belum ketemu di MUV. Pastikan username Telegram kamu sudah diisi di MUV ya.');
+    }
+    if (lookup.status === 401) {
+      return bot.sendMessage(msg.chat.id, 'Bot ini belum terhubung ke org MUV yang benar. Cek bot token dan username bot di setting MUV.');
+    }
+    return bot.sendMessage(msg.chat.id, 'Belum bisa buka wizard task. Coba lagi sebentar.');
+  }
+
+  const orgs = buildOrgChoices(lookup.data || {});
+  if (!orgs.length) return bot.sendMessage(msg.chat.id, 'Kamu belum punya organisasi MUV yang aktif.');
+
+  if (orgs.length === 1) {
+    const scoped = await getMuvBoards(msg.from.id, msg.from.username || '', { orgId: orgs[0].id });
+    const boards = scoped.data?.boards || [];
+    if (!scoped.ok || !boards.length) {
+      return bot.sendMessage(msg.chat.id, `Belum ada board aktif di ${orgs[0].name} buat bikin task.`);
+    }
+    setNewTaskSession(msg.chat.id, msg.from.id, {
+      orgs,
+      selectedOrgId: orgs[0].id,
+      orgName: orgs[0].name,
+      boards,
+      stage: 'pick-board',
+    });
+    return bot.sendMessage(msg.chat.id, `Pilih board di ${orgs[0].name}:`, {
+      reply_markup: {
+        inline_keyboard: [
+          ...chunkButtons(
+            boards.map(board => ({ text: board.name, callback_data: `muv:board:${board.id}` })),
+            2
+          ),
+          [{ text: 'Batal', callback_data: 'muv:cancel' }],
+        ],
+      },
+    });
+  }
+
+  setNewTaskSession(msg.chat.id, msg.from.id, {
+    orgs,
+    stage: 'pick-org',
+  });
+
+  await bot.sendMessage(msg.chat.id, 'Pilih organisasi dulu:', {
+    reply_markup: {
+      inline_keyboard: [
+        ...chunkButtons(orgs.map(org => ({
+          text: org.name,
+          callback_data: `muv:org:${org.id}`,
+        })), 2),
+        [{ text: 'Batal', callback_data: 'muv:cancel' }],
+      ],
+    },
+  });
+});
+
+bot.onText(/^\/today(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  const res = await getMuvCommand('today', msg.from.id, msg.from.username || '');
+  if (!res.ok) return bot.sendMessage(msg.chat.id, 'Belum bisa ambil task due hari ini.');
+  await bot.sendMessage(msg.chat.id, formatCardsList(res.data.cards, {
+    title: '*Task due hari ini*',
+    emptyText: 'Tidak ada task due hari ini. 🎉',
+  }), { parse_mode: 'Markdown' });
+});
+
+bot.onText(/^\/overdue(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  const res = await getMuvCommand('overdue', msg.from.id, msg.from.username || '');
+  if (!res.ok) return bot.sendMessage(msg.chat.id, 'Belum bisa ambil task overdue.');
+  await bot.sendMessage(msg.chat.id, formatCardsList(res.data.cards, {
+    title: '*Task overdue*',
+    emptyText: 'Tidak ada task overdue. Mantap.',
+  }), { parse_mode: 'Markdown' });
+});
+
+bot.onText(/^\/myboards(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  const res = await getMuvCommand('myboards', msg.from.id, msg.from.username || '');
+  if (!res.ok) return bot.sendMessage(msg.chat.id, 'Belum bisa ambil daftar board.');
+  if (!res.data.boards?.length) return bot.sendMessage(msg.chat.id, 'Kamu belum punya board yang bisa diakses.');
+  await bot.sendMessage(msg.chat.id, `*Board yang bisa lo akses*\n\n${formatBoardGroups(res.data.boards)}`, { parse_mode: 'Markdown' });
+});
+
+bot.onText(/^\/watching(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  const res = await getMuvCommand('watching', msg.from.id, msg.from.username || '');
+  if (!res.ok) return bot.sendMessage(msg.chat.id, 'Belum bisa ambil card watching.');
+  await bot.sendMessage(msg.chat.id, formatCardsList(res.data.cards, {
+    title: '*Card yang lo watch*',
+    emptyText: 'Belum ada card yang lo watch.',
+  }), { parse_mode: 'Markdown' });
+});
+
+bot.onText(/^\/teamtoday(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  const res = await getMuvCommand('teamtoday', msg.from.id, msg.from.username || '');
+  if (!res.ok) return bot.sendMessage(msg.chat.id, 'Belum bisa ambil due today tim.');
+  if (!res.data.cards?.length) return bot.sendMessage(msg.chat.id, 'Tidak ada task due hari ini di board yang bisa kamu lihat.');
+  const lines = res.data.cards.map((card, index) => {
+    const who = (card.assignees || []).map(a => a.name || a.email).join(', ') || '-';
+    const due = card.dueDate ? formatDueLabel(card.dueDate) : '-';
+    return `${index + 1}. *${card.title}*\n   ${card.workspaceName} → ${card.boardName}\n   ${who} · ⏰ ${due}`;
+  });
+  await bot.sendMessage(msg.chat.id, `*Due today tim*\n\n${lines.join('\n\n')}`, { parse_mode: 'Markdown' });
+});
+
+bot.onText(/^\/notif(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  const res = await getMuvCommand('notif', msg.from.id, msg.from.username || '');
+  if (!res.ok) return bot.sendMessage(msg.chat.id, 'Belum bisa ambil status notif Telegram.');
+  const prefs = res.data.prefs || [];
+  const lines = prefs.map(item => `• *${item.org.name}* — Telegram ${item.notificationPrefs?.telegramEnabled ? 'ON' : 'OFF'}`);
+  await bot.sendMessage(msg.chat.id, `*Status notif Telegram*\n\n${lines.join('\n') || 'Belum ada membership.'}`, {
+    parse_mode: 'Markdown',
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: 'Aktifkan semua', callback_data: 'muvcmd:notif:on' },
+          { text: 'Matikan semua', callback_data: 'muvcmd:notif:off' },
+        ],
+      ],
+    },
+  });
+});
+
+bot.onText(/^\/done(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  const res = await getMuvCommand('mytasks', msg.from.id, msg.from.username || '');
+  if (!res.ok || !res.data.cards?.length) return bot.sendMessage(msg.chat.id, 'Tidak ada task yang bisa dipilih.');
+  setActionSession(msg.chat.id, msg.from.id, { action: 'done', cards: res.data.cards });
+  await sendCardPicker(msg.chat.id, 'Pilih task yang mau ditandai selesai:', res.data.cards.slice(0, 12), 'muvcmd:done-card');
+});
+
+bot.onText(/^\/move(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  const res = await getMuvCommand('mytasks', msg.from.id, msg.from.username || '');
+  if (!res.ok || !res.data.cards?.length) return bot.sendMessage(msg.chat.id, 'Tidak ada task yang bisa dipilih.');
+  setActionSession(msg.chat.id, msg.from.id, { action: 'move', cards: res.data.cards });
+  await sendCardPicker(msg.chat.id, 'Pilih task yang mau dipindah:', res.data.cards.slice(0, 12), 'muvcmd:move-card');
+});
+
+bot.onText(/^\/assign(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  const res = await getMuvCommand('mytasks', msg.from.id, msg.from.username || '');
+  if (!res.ok || !res.data.cards?.length) return bot.sendMessage(msg.chat.id, 'Tidak ada task yang bisa dipilih.');
+  setActionSession(msg.chat.id, msg.from.id, { action: 'assign', cards: res.data.cards });
+  await sendCardPicker(msg.chat.id, 'Pilih task yang mau di-assign:', res.data.cards.slice(0, 12), 'muvcmd:assign-card');
+});
+
+bot.onText(/^\/due(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  const res = await getMuvCommand('mytasks', msg.from.id, msg.from.username || '');
+  if (!res.ok || !res.data.cards?.length) return bot.sendMessage(msg.chat.id, 'Tidak ada task yang bisa dipilih.');
+  setActionSession(msg.chat.id, msg.from.id, { action: 'due', cards: res.data.cards });
+  await sendCardPicker(msg.chat.id, 'Pilih task yang mau diubah due date-nya:', res.data.cards.slice(0, 12), 'muvcmd:due-card');
+});
+
+bot.onText(/^\/watch(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  const res = await getMuvCommand('mytasks', msg.from.id, msg.from.username || '');
+  if (!res.ok || !res.data.cards?.length) return bot.sendMessage(msg.chat.id, 'Tidak ada task yang bisa dipilih.');
+  setActionSession(msg.chat.id, msg.from.id, { action: 'watch', cards: res.data.cards });
+  await sendCardPicker(msg.chat.id, 'Pilih task yang mau di-watch:', res.data.cards.slice(0, 12), 'muvcmd:watch-card');
+});
+
+bot.onText(/^\/unwatch(?:@\w+)?$/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  const res = await getMuvCommand('watching', msg.from.id, msg.from.username || '');
+  if (!res.ok || !res.data.cards?.length) return bot.sendMessage(msg.chat.id, 'Belum ada card yang kamu watch.');
+  setActionSession(msg.chat.id, msg.from.id, { action: 'unwatch', cards: res.data.cards });
+  await sendCardPicker(msg.chat.id, 'Pilih task yang mau di-unwatch:', res.data.cards.slice(0, 12), 'muvcmd:unwatch-card');
+});
+
+bot.onText(/\/loud/, async (msg) => {
+  if (!isAdmin(msg.from?.id)) return;
+  loudGroups.has(msg.chat.id) ? loudGroups.delete(msg.chat.id) : loudGroups.add(msg.chat.id);
+  await bot.sendMessage(msg.chat.id, loudGroups.has(msg.chat.id)
+    ? '🔊 Loud mode ON — gue jawab semua pesan.'
+    : '🔇 Loud mode OFF — gue cuma jawab kalau di-mention atau di-reply.'
+  );
+});
+
+bot.onText(/\/status/, async (msg) => {
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  await bot.sendMessage(msg.chat.id,
+    `*Sobat Product Status*\n🤖 Processing: ${processing.has(msg.chat.id) ? 'ya' : 'idle'}\n💬 History: ${conversations.get(msg.chat.id)?.length || 0} pesan\n📊 Sheets: ${sheetsClient ? '✅' : '❌'}\n🔊 Loud: ${loudGroups.has(msg.chat.id) ? 'ON' : 'OFF (mention/reply only)'}`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.onText(/\/id/, async (msg) => {
+  if (!isAdmin(msg.from?.id)) return;
+  await bot.sendMessage(msg.chat.id,
+    `Chat: \`${msg.chat.id}\` | User: \`${msg.from?.id}\` | Type: ${msg.chat.type}`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.onText(/\/end/, async (msg) => {
+  if (!isAdmin(msg.from?.id)) return;
+  paused = true;
+  await bot.sendMessage(msg.chat.id, 'Oke, gue istirahat dulu. Ketik /start untuk aktifin gue lagi ya.');
+});
+
+bot.onText(/\/addgroup(?:\s+(-?\d+))?/, async (msg, match) => {
+  if (!isAdmin(msg.from?.id)) return;
+  const targetId = match?.[1] ? Number(match[1]) : msg.chat.id;
+  if (allowedGroupIds.includes(targetId)) {
+    return bot.sendMessage(msg.chat.id, `Group \`${targetId}\` sudah ada di daftar.`, { parse_mode: 'Markdown' });
+  }
+  allowedGroupIds.push(targetId);
+  saveGroups();
+  await bot.sendMessage(msg.chat.id, `✅ Group \`${targetId}\` ditambahkan.`, { parse_mode: 'Markdown' });
+});
+
+bot.onText(/\/removegroup(?:\s+(-?\d+))?/, async (msg, match) => {
+  if (!isAdmin(msg.from?.id)) return;
+  const targetId = match?.[1] ? Number(match[1]) : msg.chat.id;
+  const idx = allowedGroupIds.indexOf(targetId);
+  if (idx === -1) return bot.sendMessage(msg.chat.id, `Group \`${targetId}\` tidak ada.`, { parse_mode: 'Markdown' });
+  allowedGroupIds.splice(idx, 1);
+  saveGroups();
+  await bot.sendMessage(msg.chat.id, `✅ Group \`${targetId}\` dihapus.`, { parse_mode: 'Markdown' });
+});
+
+bot.onText(/\/listgroups/, async (msg) => {
+  if (!isAdmin(msg.from?.id)) return;
+  await bot.sendMessage(msg.chat.id,
+    `*Allowed Groups (${allowedGroupIds.length}):*\n${allowedGroupIds.map(id => `\`${id}\``).join('\n')}`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.on('callback_query', async (query) => {
+  const data = query.data || '';
+  const chatId = query.message?.chat?.id;
+  const fromId = query.from?.id;
+  const messageId = query.message?.message_id;
+
+  if (!chatId || !fromId || !messageId) return;
+
+  if (data.startsWith('muvview:')) {
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+
+    if (data === 'muvview:cancel') {
+      await bot.editMessageText('❎ Lihat data dibatalkan.', { chat_id: chatId, message_id: messageId }).catch(() => {});
+      return;
+    }
+
+    if (data.startsWith('muvview:pick-board-summary:')) {
+      const orgId = data.replace('muvview:pick-board-summary:', '');
+      const lookup = await getMuvBoards(fromId, query.from?.username || '', { orgId });
+      const orgName = buildOrgChoices(lookup.data || {}).find(org => org.id === orgId)?.name
+        || lookup.data?.boards?.[0]?.workspace?.name
+        || 'organisasi ini';
+      if (!lookup.ok || !lookup.data.boards?.length) {
+        await bot.editMessageText(`Belum ada board yang bisa lo lihat di ${orgName}.`, {
+          chat_id: chatId,
+          message_id: messageId,
+        }).catch(() => {});
+        return;
+      }
+      await bot.editMessageText(`Pilih board di ${orgName}:`, {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: {
+          inline_keyboard: [
+            ...chunkButtons(lookup.data.boards.slice(0, 20).map(board => ({
+              text: truncateLabel(`${board.workspace?.name || 'Workspace'} · ${board.name}`, 34),
+              callback_data: `muvview:board-summary:${board.id}`,
+            })), 1),
+            [{ text: 'Batal', callback_data: 'muvview:cancel' }],
+          ],
+        },
+      }).catch(() => {});
+      return;
+    }
+
+    if (data.startsWith('muvview:board-summary:')) {
+      const boardId = data.replace('muvview:board-summary:', '');
+      const res = await getMuvCommand('board-summary', fromId, query.from?.username || '', { boardId });
+      if (!res.ok) {
+        await bot.editMessageText(`Gagal ambil summary board: ${res.data?.error || 'unknown error'}`, { chat_id: chatId, message_id: messageId }).catch(() => {});
+        return;
+      }
+      await bot.editMessageText(formatBoardSummary(res.data.board), {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: 'Markdown',
+      }).catch(() => {});
+      return;
+    }
+
+    if (data.startsWith('muvview:pick-board-tasks:')) {
+      const orgId = data.replace('muvview:pick-board-tasks:', '');
+      const lookup = await getMuvBoards(fromId, query.from?.username || '', { orgId });
+      const orgName = buildOrgChoices(lookup.data || {}).find(org => org.id === orgId)?.name
+        || lookup.data?.boards?.[0]?.workspace?.name
+        || 'organisasi ini';
+      if (!lookup.ok || !lookup.data.boards?.length) {
+        await bot.editMessageText(`Belum ada board yang bisa lo lihat di ${orgName}.`, {
+          chat_id: chatId,
+          message_id: messageId,
+        }).catch(() => {});
+        return;
+      }
+      await bot.editMessageText(`Pilih board di ${orgName}:`, {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: {
+          inline_keyboard: [
+            ...chunkButtons(lookup.data.boards.slice(0, 20).map(board => ({
+              text: truncateLabel(`${board.workspace?.name || 'Workspace'} · ${board.name}`, 34),
+              callback_data: `muvview:board-tasks:${board.id}`,
+            })), 1),
+            [{ text: 'Batal', callback_data: 'muvview:cancel' }],
+          ],
+        },
+      }).catch(() => {});
+      return;
+    }
+
+    if (data.startsWith('muvview:board-tasks:')) {
+      const boardId = data.replace('muvview:board-tasks:', '');
+      const res = await getMuvCommand('board-cards', fromId, query.from?.username || '', { boardId, filter: 'all' });
+      if (!res.ok) {
+        await bot.editMessageText(`Gagal ambil task board: ${res.data?.error || 'unknown error'}`, { chat_id: chatId, message_id: messageId }).catch(() => {});
+        return;
+      }
+      await bot.editMessageText(formatCardsList(res.data.cards, {
+        title: `*Task di ${escMd(res.data.board.name)}*`,
+        emptyText: `Tidak ada task terbuka di ${res.data.board.name}.`,
+      }), {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true,
+      }).catch(() => {});
+      return;
+    }
+
+    if (data.startsWith('muvview:org-overdue:')) {
+      const orgId = data.replace('muvview:org-overdue:', '');
+      const res = await getMuvCommand('org-overdue', fromId, query.from?.username || '', { orgId });
+      if (!res.ok) {
+        await bot.editMessageText(`Gagal ambil overdue org: ${res.data?.error || 'unknown error'}`, { chat_id: chatId, message_id: messageId }).catch(() => {});
+        return;
+      }
+      await bot.editMessageText(formatCardsList(res.data.cards, {
+        title: `*Overdue ${escMd(res.data.org?.name || 'Organisasi')}*`,
+        emptyText: `Tidak ada task overdue di ${res.data.org?.name || 'organisasi ini'}.`,
+      }), {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true,
+      }).catch(() => {});
+      return;
+    }
+  }
+
+  if (data.startsWith('muvcmd:')) {
+    const actionSession = getActionSession(chatId, fromId);
+
+    if (data === 'muvcmd:cancel') {
+      clearActionSession(chatId, fromId);
+      await bot.answerCallbackQuery(query.id).catch(() => {});
+      await bot.editMessageText('❎ Aksi dibatalkan.', { chat_id: chatId, message_id: messageId }).catch(() => {});
+      return;
+    }
+
+    if (data === 'muvcmd:notif:on' || data === 'muvcmd:notif:off') {
+      const enabled = data.endsWith(':on');
+      const res = await postMuvAction('notif', fromId, query.from?.username || '', { telegramEnabled: enabled });
+      await bot.answerCallbackQuery(query.id).catch(() => {});
+      await bot.editMessageText(
+        res.ok ? `✅ Notif Telegram sekarang ${enabled ? 'aktif' : 'mati'} untuk semua membership kamu.` : 'Gagal update notif Telegram.',
+        { chat_id: chatId, message_id: messageId }
+      ).catch(() => {});
+      return;
+    }
+
+    if (!actionSession) {
+      await bot.answerCallbackQuery(query.id, { text: 'Sesi aksi sudah habis' }).catch(() => {});
+      return;
+    }
+
+    const runCardAction = async (action, cardId, extra = {}) => {
+      const res = await postMuvAction(action, fromId, query.from?.username || '', { cardId, ...extra });
+      await bot.answerCallbackQuery(query.id).catch(() => {});
+      if (!res.ok) {
+        await bot.editMessageText(`Gagal: ${res.data?.error || 'unknown error'}`, {
+          chat_id: chatId,
+          message_id: messageId,
+        }).catch(() => {});
+        clearActionSession(chatId, fromId);
+        return true;
+      }
+      return res;
+    };
+
+    if (data.startsWith('muvcmd:done-card:')) {
+      const cardId = data.replace('muvcmd:done-card:', '');
+      const res = await runCardAction('done', cardId);
+      if (res === true) return;
+      clearActionSession(chatId, fromId);
+      await bot.editMessageText(`✅ Task dipindah ke ${res.data.card.listName}\n\n${res.data.card.title}\n${res.data.card.url}`, {
+        chat_id: chatId,
+        message_id: messageId,
+        disable_web_page_preview: true,
+      }).catch(() => {});
+      return;
+    }
+
+    if (data.startsWith('muvcmd:watch-card:')) {
+      const cardId = data.replace('muvcmd:watch-card:', '');
+      const res = await runCardAction('watch', cardId);
+      if (res === true) return;
+      clearActionSession(chatId, fromId);
+      await bot.editMessageText(`✅ Sekarang kamu watch task ini:\n\n${res.data.card.title}\n${res.data.card.url}`, {
+        chat_id: chatId,
+        message_id: messageId,
+        disable_web_page_preview: true,
+      }).catch(() => {});
+      return;
+    }
+
+    if (data.startsWith('muvcmd:unwatch-card:')) {
+      const cardId = data.replace('muvcmd:unwatch-card:', '');
+      const res = await runCardAction('unwatch', cardId);
+      if (res === true) return;
+      clearActionSession(chatId, fromId);
+      await bot.editMessageText(`✅ Task ini sudah di-unwatch:\n\n${res.data.card.title}\n${res.data.card.url}`, {
+        chat_id: chatId,
+        message_id: messageId,
+        disable_web_page_preview: true,
+      }).catch(() => {});
+      return;
+    }
+
+    if (data.startsWith('muvcmd:move-card:') || data.startsWith('muvcmd:assign-card:') || data.startsWith('muvcmd:due-card:')) {
+      const [prefix, cardId] = data.startsWith('muvcmd:move-card:')
+        ? ['move', data.replace('muvcmd:move-card:', '')]
+        : data.startsWith('muvcmd:assign-card:')
+          ? ['assign', data.replace('muvcmd:assign-card:', '')]
+          : ['due', data.replace('muvcmd:due-card:', '')];
+
+      const ctx = await getMuvCommand('card-context', fromId, query.from?.username || '', { cardId });
+      if (!ctx.ok) {
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+        await bot.editMessageText(`Gagal ambil konteks card: ${ctx.data?.error || 'unknown error'}`, {
+          chat_id: chatId,
+          message_id: messageId,
+        }).catch(() => {});
+        clearActionSession(chatId, fromId);
+        return;
+      }
+
+      if (prefix === 'move') {
+        setActionSession(chatId, fromId, { ...actionSession, action: 'move', card: ctx.data.card });
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+        await bot.editMessageText(`Pilih list tujuan untuk:\n${ctx.data.card.title}`, {
+          chat_id: chatId,
+          message_id: messageId,
+          reply_markup: {
+            inline_keyboard: [
+              ...chunkButtons(ctx.data.card.lists.map(list => ({ text: list.name, callback_data: `muvcmd:move-list:${list.id}` })), 2),
+              [{ text: 'Batal', callback_data: 'muvcmd:cancel' }],
+            ],
+          },
+        }).catch(() => {});
+        return;
+      }
+
+      if (prefix === 'assign') {
+        setActionSession(chatId, fromId, { ...actionSession, action: 'assign', card: ctx.data.card });
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+        await bot.editMessageText(`Pilih assignee untuk:\n${ctx.data.card.title}`, {
+          chat_id: chatId,
+          message_id: messageId,
+          reply_markup: {
+            inline_keyboard: [
+              ...chunkButtons(ctx.data.card.members.slice(0, 20).map(member => ({
+                text: truncateLabel(member.name || member.email, 28),
+                callback_data: `muvcmd:assign-member:${member.id}`,
+              })), 2),
+              [{ text: 'Batal', callback_data: 'muvcmd:cancel' }],
+            ],
+          },
+        }).catch(() => {});
+        return;
+      }
+
+      setActionSession(chatId, fromId, { ...actionSession, action: 'due', card: ctx.data.card });
+      await bot.answerCallbackQuery(query.id).catch(() => {});
+      await bot.editMessageText(`Pilih due date untuk:\n${ctx.data.card.title}`, {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: {
+          inline_keyboard: [
+            ...chunkButtons([
+              { text: 'Hari ini 17:00', callback_data: 'muvcmd:due-set:today-17' },
+              { text: 'Besok 09:00', callback_data: 'muvcmd:due-set:tomorrow-09' },
+              { text: 'Besok 17:00', callback_data: 'muvcmd:due-set:tomorrow-17' },
+              { text: 'Hapus due', callback_data: 'muvcmd:due-set:none' },
+            ], 2),
+            [{ text: 'Batal', callback_data: 'muvcmd:cancel' }],
+          ],
+        },
+      }).catch(() => {});
+      return;
+    }
+
+    if (data.startsWith('muvcmd:move-list:')) {
+      const cardId = actionSession.card?.id;
+      const targetListId = data.replace('muvcmd:move-list:', '');
+      if (!cardId || !targetListId) {
+        await bot.answerCallbackQuery(query.id, { text: 'Sesi move sudah habis' }).catch(() => {});
+        clearActionSession(chatId, fromId);
+        return;
+      }
+      const res = await runCardAction('move', cardId, { listId: targetListId });
+      if (res === true) return;
+      clearActionSession(chatId, fromId);
+      await bot.editMessageText(`✅ Task dipindah ke ${res.data.card.listName}\n\n${res.data.card.title}\n${res.data.card.url}`, {
+        chat_id: chatId,
+        message_id: messageId,
+        disable_web_page_preview: true,
+      }).catch(() => {});
+      return;
+    }
+
+    if (data.startsWith('muvcmd:assign-member:')) {
+      const cardId = actionSession.card?.id;
+      const assigneeId = data.replace('muvcmd:assign-member:', '');
+      if (!cardId || !assigneeId) {
+        await bot.answerCallbackQuery(query.id, { text: 'Sesi assign sudah habis' }).catch(() => {});
+        clearActionSession(chatId, fromId);
+        return;
+      }
+      const res = await runCardAction('assign', cardId, { assigneeId });
+      if (res === true) return;
+      clearActionSession(chatId, fromId);
+      const who = res.data.assignee.name || res.data.assignee.email;
+      await bot.editMessageText(`✅ Task di-assign ke ${who}\n\n${res.data.card.title}\n${res.data.card.url}`, {
+        chat_id: chatId,
+        message_id: messageId,
+        disable_web_page_preview: true,
+      }).catch(() => {});
+      return;
+    }
+
+    if (data.startsWith('muvcmd:due-set:')) {
+      const cardId = actionSession.card?.id;
+      const preset = data.replace('muvcmd:due-set:', '');
+      if (!cardId || !preset) {
+        await bot.answerCallbackQuery(query.id, { text: 'Sesi due sudah habis' }).catch(() => {});
+        clearActionSession(chatId, fromId);
+        return;
+      }
+      const res = await runCardAction('due', cardId, { dueDate: duePresetToIso(preset) });
+      if (res === true) return;
+      clearActionSession(chatId, fromId);
+      const dueLine = res.data.card.dueDate ? `⏰ ${formatDueLabel(res.data.card.dueDate)}` : 'Tanpa due date';
+      await bot.editMessageText(`✅ Due date diupdate\n\n${res.data.card.title}\n${dueLine}\n${res.data.card.url}`, {
+        chat_id: chatId,
+        message_id: messageId,
+        disable_web_page_preview: true,
+      }).catch(() => {});
+      return;
+    }
+  }
+
+  if (!data.startsWith('muv:')) return;
+
+  const session = getNewTaskSession(chatId, fromId);
+  if (!session) {
+    await bot.answerCallbackQuery(query.id, { text: 'Sesi /new sudah habis' }).catch(() => {});
+    return;
+  }
+
+  if (data === 'muv:cancel') {
+    clearNewTaskSession(chatId, fromId);
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+    await bot.editMessageText('❎ Pembuatan task dibatalkan.', {
+      chat_id: chatId,
+      message_id: messageId,
+    }).catch(() => {});
+    return;
+  }
+
+  if (data.startsWith('muv:org:')) {
+    const orgId = data.replace('muv:org:', '');
+    const org = session.orgs?.find(item => item.id === orgId);
+    if (!org) {
+      await bot.answerCallbackQuery(query.id, { text: 'Organisasi tidak ditemukan' }).catch(() => {});
+      return;
+    }
+
+    const scoped = await getMuvBoards(fromId, query.from?.username || '', { orgId });
+    const boards = scoped.data?.boards || [];
+    if (!scoped.ok || !boards.length) {
+      await bot.answerCallbackQuery(query.id).catch(() => {});
+      await bot.editMessageText(`Belum ada board aktif di ${org.name} buat bikin task.`, {
+        chat_id: chatId,
+        message_id: messageId,
+      }).catch(() => {});
+      clearNewTaskSession(chatId, fromId);
+      return;
+    }
+
+    setNewTaskSession(chatId, fromId, {
+      ...session,
+      selectedOrgId: orgId,
+      orgName: org.name,
+      boards,
+      stage: 'pick-board',
+    });
+
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+    await bot.editMessageText(`Pilih board di ${org.name}:`, {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: {
+        inline_keyboard: [
+          ...chunkButtons(
+            boards.map(board => ({ text: board.name, callback_data: `muv:board:${board.id}` })),
+            2
+          ),
+          [{ text: 'Batal', callback_data: 'muv:cancel' }],
+        ],
+      },
+    }).catch(() => {});
+    return;
+  }
+
+  if (data.startsWith('muv:board:')) {
+    const boardId = data.replace('muv:board:', '');
+    const board = session.boards?.find(item => item.id === boardId);
+    if (!board) {
+      await bot.answerCallbackQuery(query.id, { text: 'Board tidak ditemukan' }).catch(() => {});
+      return;
+    }
+
+    setNewTaskSession(chatId, fromId, {
+      ...session,
+      boardId,
+      boardName: board.name,
+      lists: board.lists || [],
+      stage: 'pick-list',
+    });
+
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+    await bot.editMessageText(`Pilih list untuk board: ${board.name}`, {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: {
+        inline_keyboard: [
+          ...chunkButtons(
+            (board.lists || []).map(list => ({ text: list.name, callback_data: `muv:list:${list.id}` })),
+            2
+          ),
+          [{ text: 'Batal', callback_data: 'muv:cancel' }],
+        ],
+      },
+    }).catch(() => {});
+    return;
+  }
+
+  if (data.startsWith('muv:list:')) {
+    const listId = data.replace('muv:list:', '');
+    const list = session.lists?.find(item => item.id === listId);
+    if (!list) {
+      await bot.answerCallbackQuery(query.id, { text: 'List tidak ditemukan' }).catch(() => {});
+      return;
+    }
+
+    setNewTaskSession(chatId, fromId, {
+      ...session,
+      listId,
+      listName: list.name,
+      stage: 'await-title',
+    });
+
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+    await bot.editMessageText(
+      `Board: ${session.boardName}\nList: ${list.name}\n\nSekarang kirim judul task.\nKetik "batal" kalau jadi batal.`,
+      {
+        chat_id: chatId,
+        message_id: messageId,
+      }
+    ).catch(() => {});
+    return;
+  }
+
+  if (data.startsWith('muv:due:')) {
+    if (session.stage !== 'pick-due' || !session.title || !session.listId) {
+      await bot.answerCallbackQuery(query.id, { text: 'Sesi tidak valid' }).catch(() => {});
+      return;
+    }
+
+    const duePreset = data.replace('muv:due:', '');
+    const dueDate = duePresetToIso(duePreset);
+    const createRes = await createMuvCard({
+      fromId,
+      username: query.from?.username || '',
+      listId: session.listId,
+      title: session.title,
+      dueDate,
+    });
+
+    if (!createRes.ok) {
+      const errorText = createRes.data?.error ? `Task belum berhasil dibuat: ${createRes.data.error}` : 'Task belum berhasil dibuat. Coba /new lagi sebentar.';
+      clearNewTaskSession(chatId, fromId);
+      await bot.answerCallbackQuery(query.id, { text: 'Gagal bikin task' }).catch(() => {});
+      await bot.editMessageText(errorText, {
+        chat_id: chatId,
+        message_id: messageId,
+      }).catch(() => {});
+      return;
+    }
+
+    clearNewTaskSession(chatId, fromId);
+    const card = createRes.data.card;
+    const dueLine = card?.dueDate ? `\n⏰ ${formatDueLabel(card.dueDate)}` : '';
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+    await bot.editMessageText(
+      `✅ Task dibuat di ${card.boardName} → ${card.listName}\n\n${card.title}${dueLine}\n${card.url}`,
+      {
+        chat_id: chatId,
+        message_id: messageId,
+        disable_web_page_preview: true,
+      }
+    ).catch(() => {});
+  }
+});
+
+// ─── File extraction helpers ──────────────────────────────────────────────────
+async function downloadFile(fileId) {
+  const fileInfo = await bot.getFile(fileId);
+  const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Download failed: ${res.status}`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+async function extractFileContent(msg) {
+  const isPhoto = !!msg.photo;
+  const doc  = msg.document;
+  const mime = doc?.mime_type || '';
+  const caption = (msg.caption || '').trim();
+
+  if (isPhoto || mime.startsWith('image/')) {
+    const fileId = isPhoto ? msg.photo[msg.photo.length - 1].file_id : doc.file_id;
+    const buf = await downloadFile(fileId);
+    const mediaType = isPhoto ? 'image/jpeg' : (mime || 'image/jpeg');
+    return { type: 'image', base64: buf.toString('base64'), mediaType, caption };
+  }
+
+  if (mime === 'application/pdf') {
+    const buf  = await downloadFile(doc.file_id);
+    const data = await pdfParse(buf);
+    return { type: 'text', content: `[File PDF: ${doc.file_name}]\n\n${data.text.slice(0, 12000)}`, caption };
+  }
+
+  if (mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+    const buf    = await downloadFile(doc.file_id);
+    const result = await mammoth.extractRawText({ buffer: buf });
+    return { type: 'text', content: `[File DOCX: ${doc.file_name}]\n\n${result.value.slice(0, 12000)}`, caption };
+  }
+
+  if (mime.startsWith('text/') || ['application/json', 'text/csv', 'text/markdown'].includes(mime)
+      || /\.(txt|csv|json|md|yaml|yml|xml)$/i.test(doc.file_name || '')) {
+    const buf  = await downloadFile(doc.file_id);
+    return { type: 'text', content: `[File: ${doc.file_name}]\n\n${buf.toString('utf-8').slice(0, 12000)}`, caption };
+  }
+
+  return null;
+}
+
+// ─── Main listener ────────────────────────────────────────────────────────────
+bot.on("message", async (msg) => {
+  console.log("[msg]", msg.chat.id, msg.chat.type, msg.text?.slice(0,50));
+  console.log("[msg]", msg.chat.id, msg.chat.type, msg.text?.slice(0,40));
+  const chatId   = msg.chat.id;
+  const text     = msg.text?.trim();
+  const chatType = msg.chat.type;
+  const fromId   = msg.from?.id;
+  const fromName = msg.from?.first_name || msg.from?.username || 'Seseorang';
+
+  if (text && text.startsWith('/')) return;
+
+  // ─── File handler ───
+  const hasFile = !!msg.photo || !!msg.document;
+  if (hasFile) {
+    if (paused && !isAdmin(fromId)) { console.log('[msg] blocked: paused'); return; }
+    if (chatType === 'private' && !isAllowedUser(fromId)) { console.log('[msg] blocked: private not allowed'); return; }
+    if ((chatType === 'group' || chatType === 'supergroup') && !isAllowedGroup(chatId)) { console.log('[msg] blocked: group ' + chatId + ' not in allowedGroupIds'); return; }
+    if ((chatType === 'group' || chatType === 'supergroup') && !loudGroups.has(chatId)) {
+      const caption     = msg.caption || '';
+      const isMentioned = BOT_USERNAME && caption.includes(`@${BOT_USERNAME}`);
+      const isReply     = msg.reply_to_message?.from?.id === botInfo?.id;
+      if (!isMentioned && !isReply) { console.log('[msg] blocked: file no mention/reply'); return; }
+    }
+    if (processing.has(chatId)) { console.log('[msg] blocked: processing (file)'); return; }
+
+    await bot.sendChatAction(chatId, 'typing').catch(() => {});
+    let extracted;
+    try {
+      extracted = await extractFileContent(msg);
+    } catch (e) {
+      await bot.sendMessage(chatId, `Gagal baca file: ${e.message}`, { reply_to_message_id: msg.message_id });
+      return;
+    }
+    if (!extracted) {
+      await bot.sendMessage(chatId, 'Format file ini belum didukung. Yang bisa gue baca: gambar, PDF, DOCX, TXT, CSV, JSON.', {
+        reply_to_message_id: msg.message_id,
+      });
+      return;
+    }
+
+    const instruction = extracted.caption || 'Baca dan ringkas isi file ini.';
+    let userContent;
+    if (extracted.type === 'image') {
+      userContent = [
+        { type: 'image', source: { type: 'base64', media_type: extracted.mediaType, data: extracted.base64 } },
+        { type: 'text', text: `[${fromName}]: ${instruction}` },
+      ];
+    } else {
+      userContent = `[${fromName}]: ${instruction}\n\n${extracted.content}`;
+    }
+    await handleMessage(chatId, userContent, msg.message_id, fromId).catch(console.error);
+    return;
+  }
+
+  // ─── Text handler ───
+  if (!text) return;
+  if (paused && !isAdmin(fromId)) { console.log('[msg] blocked: paused'); return; }
+
+  const taskSession = getNewTaskSession(chatId, fromId);
+  if (taskSession?.stage === 'await-title') {
+    if (text.toLowerCase() === 'batal') {
+      clearNewTaskSession(chatId, fromId);
+      await bot.sendMessage(chatId, '❎ Pembuatan task dibatalkan.', { reply_to_message_id: msg.message_id }).catch(() => {});
+      return;
+    }
+
+    setNewTaskSession(chatId, fromId, {
+      ...taskSession,
+      title: text.slice(0, 180).trim(),
+      stage: 'pick-due',
+    });
+
+    await bot.sendMessage(chatId, 'Pilih due date:', {
+      reply_markup: {
+        inline_keyboard: [
+          ...chunkButtons([
+            { text: 'Hari ini 17:00', callback_data: 'muv:due:today-17' },
+            { text: 'Besok 09:00', callback_data: 'muv:due:tomorrow-09' },
+            { text: 'Besok 17:00', callback_data: 'muv:due:tomorrow-17' },
+            { text: 'Tanpa due', callback_data: 'muv:due:none' },
+          ], 2),
+          [{ text: 'Batal', callback_data: 'muv:cancel' }],
+        ],
+      },
+    }).catch(() => {});
+    return;
+  }
+
+  if (/^bisa baca muv\??$/i.test(text)) {
+    await bot.sendMessage(chatId, 'Bisa. Sekarang gue bisa bantu bikin task ke MUV lewat /new. Kalau mau diskusi lanjutan soal task atau ide, tinggal chat biasa.', {
+      reply_to_message_id: msg.message_id,
+    }).catch(() => {});
+    return;
+  }
+
+  if (chatType === 'private') {
+    if (!isAllowedUser(fromId) && !isAdmin(fromId)) { console.log('[msg] blocked: private not allowed'); return; }
+    if (fromId && !notifiedUsers.has(fromId) && !isAdmin(fromId)) {
+      notifiedUsers.add(fromId);
+      notifyAdmin(msg);
+    }
+    await handleMessage(chatId, text, msg.message_id, fromId).catch(console.error);
+    return;
+  }
+
+  if (chatType === 'group' || chatType === 'supergroup') {
+    if (!isAllowedGroup(chatId)) { console.log('[msg] blocked: group ' + chatId + ' not in allowedGroupIds'); return; }
+
+    const myUsername  = BOT_USERNAME ? `@${BOT_USERNAME}`.toLowerCase() : null;
+    const isMentioned = myUsername && text.toLowerCase().includes(myUsername);
+    const isReply     = msg.reply_to_message?.from?.id === botInfo?.id;
+
+    // Skip kalau pesan mention bot lain tapi bukan gue
+    const otherBotMentions = (text.match(/@\w+/g) || [])
+      .filter(m => /bot|care/i.test(m) && myUsername && m.toLowerCase() !== myUsername);
+    if (otherBotMentions.length > 0 && !isMentioned && !isReply) { console.log('[msg] blocked: other bot mention'); return; }
+
+    if (!loudGroups.has(chatId)) {
+      const triggered = isTriggerKeyword(text);
+      if (!isMentioned && !isReply && !triggered) { console.log('[msg] skipped: no mention/reply/trigger'); return; }
+    }
+
+    if (processing.has(chatId)) { console.log('[msg] blocked: processing'); return; }
+
+    console.log('[msg] handling: mentioned=' + isMentioned + ' reply=' + isReply);
+    const cleanText = text.replace(new RegExp(`@${BOT_USERNAME}`, 'gi'), '').trim();
+    await handleMessage(chatId, `[${fromName}]: ${cleanText || text}`, msg.message_id, fromId).catch(console.error);
+  }
+});
+
+bot.on('polling_error', (err) => {
+  if (err.message.includes('409')) return;
+  if (err.message.includes('EFATAL')) {
+    console.error('[polling] EFATAL — exiting for Docker restart');
+    process.exit(1);
+  }
+  console.error('[polling_error]', err.message);
+});
+
+setTimeout(async () => {
+  for (const id of ADMIN_IDS) {
+    await bot.sendMessage(id, '🟢 Sobat Product online.').catch(() => {});
+  }
+}, 4000);
+
+await initGoogle();
+initScheduler(bot, client);
+
+// ─── Test scheduler (admin only) ─────────────────────────────────────────────
+const { testFire07, testFire11, testFire15, testFire17 } = await import('./scheduler.js');
+
+bot.onText(/\/testsched(?:\s+(\d+))?/, async (msg, match) => {
+  if (!isAdmin(msg.from?.id)) return;
+  const slot = match?.[1] || '07';
+  await bot.sendMessage(msg.chat.id, `Firing ${slot}:00...`).catch(() => {});
+  try {
+    if (slot === '07') await testFire07(bot, client);
+    else if (slot === '11') await testFire11(bot, client);
+    else if (slot === '15') await testFire15(bot, client);
+    else if (slot === '17') await testFire17(bot, client);
+    else { await bot.sendMessage(msg.chat.id, 'Slot valid: 07, 11, 15, 17'); return; }
+    await bot.sendMessage(msg.chat.id, 'Done. Check groups.').catch(() => {});
+  } catch (e) {
+    await bot.sendMessage(msg.chat.id, `Error: ${e.message}`).catch(() => {});
+  }
+});
+
+console.log('Sobat Product started. Groups:', allowedGroupIds);
