@@ -106,6 +106,11 @@ export function registerSidCoreCommands(bot, { isSidCoreAllowedUser }) {
   // SID Core biasa). Dry-run nulis Completion % ke sheet dulu (informasi progress peserta) SEBELUM
   // minta konfirmasi "ya" - biar tim gak salah hapus peserta yang udah jauh progressnya.
   bot.onText(/^\/removeprogram(?:@\w+)?(?:\s+(\S+))?$/, (msg) => handleCommand(msg, 'delete-program-participant.js', 'remove-program-participant'));
+  // change-program-status.js: ubah Status Program (Dalam Rencana/Aktif Pendaftaran/Aktif/Arsip/
+  // Tutup). Endpoint submit-nya (program/manage/basic) FULL-REPLACE seluruh objek program
+  // (bo_list/program_bo_dimensions/pic/dst ikut kekirim ulang) - script fetch state FRESH
+  // (get/basic/{id}) tiap baris, ganti cuma field status, sisanya passthrough apa adanya.
+  bot.onText(/^\/programstatus(?:@\w+)?(?:\s+(\S+))?$/, (msg) => handleCommand(msg, 'change-program-status.js', 'change-program-status'));
   // add-program-participant.js: tambah user ke Program (skip otomatis kalau udah jadi peserta).
   bot.onText(/^\/addprogram(?:@\w+)?(?:\s+(\S+))?$/, (msg) => handleCommand(msg, 'add-program-participant.js', 'add-program-participant'));
   // manage-platform-org.js / manage-platform-role.js: kaitkan/lepas Organisasi/Role dari
@@ -117,6 +122,13 @@ export function registerSidCoreCommands(bot, { isSidCoreAllowedUser }) {
   bot.onText(/^\/addpic(?:@\w+)?(?:\s+(\S+))?$/, (msg) => handleCommand(msg, 'manage-pic-program.js', 'manage-pic-program'));
   // manage-group-program.js: Tambah/Ubah/Hapus Kelompok + Tambah/Pindah Anggota, 1 sheet Aksi.
   bot.onText(/^\/kelompok(?:@\w+)?(?:\s+(\S+))?$/, (msg) => handleCommand(msg, 'manage-group-program.js', 'manage-group-program'));
+  // manage-voucher-discount.js: tambah/update aturan diskon (produk+persentase) di campaign
+  // voucher yang sudah ada (sheet Manage Voucher Diskon, tab Template). v1 khusus pola HRSID
+  // (org Sekolah Murid Merdeka id 5, 3 produk fixed) - lihat CLAUDE.md utk detail & gotcha.
+  bot.onText(/^\/voucher(?:@\w+)?(?:\s+(\S+))?$/, (msg) => handleCommand(msg, 'manage-voucher-discount.js', 'manage-voucher-discount'));
+  // create-voucher-campaign.js: bikin campaign voucher BARU dari nol (sheet Manage Voucher
+  // Diskon, tab "Buat Baru") - khusus pola HRSID juga, endpoint create sekaligus bikin rules.
+  bot.onText(/^\/newvoucher(?:@\w+)?(?:\s+(\S+))?$/, (msg) => handleCommand(msg, 'create-voucher-campaign.js', 'create-voucher-campaign'));
 
   // sync-role-template.js gak ada mode --execute (cuma nulis tab "Template" yang emang
   // dirancang buat ditulis ulang, bukan role beneran) - jadi langsung jalan, gak perlu dry-run+konfirmasi.
