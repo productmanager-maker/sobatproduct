@@ -11,6 +11,7 @@ services:
       - ./data:/app/data
       - /home/product/sid-core-automation:/app/sid-core-automation:ro
       - /home/product/role-dashboard/data/role-descriptions.json:/app/role-descriptions.json
+      - /home/product/role-dashboard/data/role-code-mapping.json:/app/role-code-mapping.json
     networks:
       - proxy
 

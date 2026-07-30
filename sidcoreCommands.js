@@ -225,6 +225,37 @@ export function registerSidCoreCommands(bot, { isSidCoreAllowedUser }) {
     }
   });
 
+  // reconcile-role-code.js: cocokkan Role Code dari katalog manual tim ("Importrange ROLE SID",
+  // di-IMPORTRANGE dari sheet redesign role terpisah) ke role LIVE (tab Role). Auto-match nama
+  // persis, sisanya ditulis ke tab "Rekonsiliasi Role Code" (kolom B bisa diisi manual, lalu
+  // jalanin ulang command ini buat sync). Output siap-share ada di tab "Usulan Katalog Role".
+  // Mapping yang udah dikonfirmasi disimpen persisten (role-code-mapping.json), gak perlu
+  // diulang tiap run - cuma role BARU yang bakal muncul "BELUM ADA KODE".
+  bot.onText(/^\/rekonrole(?:@\w+)?$/, async (msg) => {
+    const chatId = msg.chat.id;
+    const fromId = msg.from?.id;
+
+    if (msg.chat.type !== 'private') {
+      return bot.sendMessage(chatId, 'Command ini cuma bisa dipakai lewat chat pribadi (DM) ke bot, biar token gak ke-expose ke grup.');
+    }
+    if (!isSidCoreAllowedUser(fromId)) {
+      return bot.sendMessage(chatId, 'Kamu belum diizinkan pakai command ini.');
+    }
+    if (isRunning(chatId)) {
+      return bot.sendMessage(chatId, 'Masih ada proses SID Core lain yang jalan buat kamu, tunggu selesai dulu ya.');
+    }
+
+    runningChats.add(chatId);
+    try {
+      await bot.sendMessage(chatId, 'Rekonsiliasi Role Code (live vs katalog manual) + update tab Usulan Katalog Role...');
+      const { code, output } = await runScript('reconcile-role-code.js', 'n/a', false);
+      await bot.sendMessage(chatId, truncate(output || '(kosong)'));
+      await bot.sendMessage(chatId, code === 0 ? 'Selesai.' : 'Ada error, cek log di atas.');
+    } finally {
+      runningChats.delete(chatId);
+    }
+  });
+
   // export-organizations.js juga non-destruktif (cuma baca semua organisasi & tulis ke sheet export) -
   // langsung jalan, gak perlu dry-run+konfirmasi.
   bot.onText(/^\/exportorg(?:@\w+)?(?:\s+(\S+))?$/, async (msg) => {
