@@ -10,7 +10,7 @@ services:
       - ./google-credentials.json:/app/google-credentials.json:ro
       - ./data:/app/data
       - /home/product/sid-core-automation:/app/sid-core-automation:ro
-      - /home/product/role-dashboard/data/role-descriptions.json:/app/role-descriptions.json:ro
+      - /home/product/role-dashboard/data/role-descriptions.json:/app/role-descriptions.json
     networks:
       - proxy
 

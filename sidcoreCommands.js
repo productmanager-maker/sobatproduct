@@ -216,7 +216,7 @@ export function registerSidCoreCommands(bot, { isSidCoreAllowedUser }) {
 
     runningChats.add(chatId);
     try {
-      await bot.sendMessage(chatId, 'Tulis Type/Scope/Deskripsi (AI) ke tab Role...');
+      await bot.sendMessage(chatId, 'Generate deskripsi role baru (kalau ada) + tulis Type/Scope/Deskripsi ke tab Role... (bisa beberapa menit kalau banyak role baru)');
       const { code, output } = await runScript('export-role-descriptions.js', 'n/a', false);
       await bot.sendMessage(chatId, truncate(output || '(kosong)'));
       await bot.sendMessage(chatId, code === 0 ? 'Selesai.' : 'Ada error, cek log di atas.');
