@@ -196,6 +196,35 @@ export function registerSidCoreCommands(bot, { isSidCoreAllowedUser }) {
     }
   });
 
+  // export-role-descriptions.js: baca data/role-descriptions.json (hasil generate-descriptions.js
+  // di project role-dashboard, DI LUAR sid-core-automation) & tulis kolom Type/Scope/Deskripsi (AI)
+  // ke tab Role (kolom F/G/H). Gak butuh SID_CORE_TOKEN (gak manggil API SID Core sama sekali),
+  // cuma baca file lokal + tulis sheet - jadi command ini gak minta token kayak yang lain.
+  bot.onText(/^\/exportdeskripsi(?:@\w+)?$/, async (msg) => {
+    const chatId = msg.chat.id;
+    const fromId = msg.from?.id;
+
+    if (msg.chat.type !== 'private') {
+      return bot.sendMessage(chatId, 'Command ini cuma bisa dipakai lewat chat pribadi (DM) ke bot, biar token gak ke-expose ke grup.');
+    }
+    if (!isSidCoreAllowedUser(fromId)) {
+      return bot.sendMessage(chatId, 'Kamu belum diizinkan pakai command ini.');
+    }
+    if (isRunning(chatId)) {
+      return bot.sendMessage(chatId, 'Masih ada proses SID Core lain yang jalan buat kamu, tunggu selesai dulu ya.');
+    }
+
+    runningChats.add(chatId);
+    try {
+      await bot.sendMessage(chatId, 'Tulis Type/Scope/Deskripsi (AI) ke tab Role...');
+      const { code, output } = await runScript('export-role-descriptions.js', 'n/a', false);
+      await bot.sendMessage(chatId, truncate(output || '(kosong)'));
+      await bot.sendMessage(chatId, code === 0 ? 'Selesai.' : 'Ada error, cek log di atas.');
+    } finally {
+      runningChats.delete(chatId);
+    }
+  });
+
   // export-organizations.js juga non-destruktif (cuma baca semua organisasi & tulis ke sheet export) -
   // langsung jalan, gak perlu dry-run+konfirmasi.
   bot.onText(/^\/exportorg(?:@\w+)?(?:\s+(\S+))?$/, async (msg) => {
