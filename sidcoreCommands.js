@@ -24,7 +24,7 @@ function isRunning(chatId) {
   return runningChats.has(chatId);
 }
 
-function runScript(scriptName, token, execute, extraArgs = []) {
+function runScript(scriptName, token, execute, extraArgs = [], timeoutMs = TIMEOUT_MS) {
   return new Promise((resolve) => {
     const args = [scriptName, ...extraArgs];
     if (execute) args.push('--execute');
@@ -37,8 +37,8 @@ function runScript(scriptName, token, execute, extraArgs = []) {
     child.stderr.on('data', (d) => { out += d.toString(); });
     const timer = setTimeout(() => {
       child.kill();
-      resolve({ code: -1, output: out + `\n[timeout, script dihentikan paksa setelah ${TIMEOUT_MS / 60000} menit]` });
-    }, TIMEOUT_MS);
+      resolve({ code: -1, output: out + `\n[timeout, script dihentikan paksa setelah ${timeoutMs / 60000} menit]` });
+    }, timeoutMs);
     child.on('close', (code) => {
       clearTimeout(timer);
       resolve({ code, output: out });
@@ -97,6 +97,11 @@ export function registerSidCoreCommands(bot, { isSidCoreAllowedUser }) {
 
   bot.onText(/^\/resign(?:@\w+)?(?:\s+(\S+))?$/, (msg) => handleCommand(msg, 'resign-cleanup.js', 'resign-cleanup'));
   bot.onText(/^\/role(?:@\w+)?(?:\s+(\S+))?$/, (msg) => handleCommand(msg, 'create-roles.js', 'create-roles'));
+  // edit-role.js: ubah nama + permission role YANG SUDAH ADA, sumbernya sheet
+  // "EDIT Role & Permission" tab "Ganti Nama" (semua role udah pre-listed, isi kolom Nama
+  // Peran Baru) + tab "Ganti Permission" (append baris ID Role/Hak Akses/Slug) - beda dari
+  // /role yang cuma bisa bikin role baru.
+  bot.onText(/^\/editrole(?:@\w+)?(?:\s+(\S+))?$/, (msg) => handleCommand(msg, 'edit-role.js', 'edit-role'));
   bot.onText(/^\/updateuser(?:@\w+)?(?:\s+(\S+))?$/, (msg) => handleCommand(msg, 'update-user-data.js', 'update-user-data'));
   // update-user-role.js: Aksi "Tambah" full-support (dry-run + execute, resolve platform_role_id
   // dari role/platform/{id} per platform - lihat CLAUDE.md). Aksi "Hapus" tetap ditunda ("Ditunda"
@@ -387,6 +392,77 @@ export function registerSidCoreCommands(bot, { isSidCoreAllowedUser }) {
     try {
       await bot.sendMessage(chatId, 'Cek detail ID Program (Nama/Periode/Organisasi/Platform/Status/Peserta) dari sheet Detail Program...');
       const { code, output } = await runScript('check-program-detail.js', token, false);
+      await bot.sendMessage(chatId, truncate(output || '(kosong)'));
+      await bot.sendMessage(chatId, code === 0 ? 'Selesai.' : 'Ada error, cek log di atas.');
+    } finally {
+      runningChats.delete(chatId);
+    }
+  });
+
+  // export-vouchers.js: non-destruktif (baca semua campaign/voucher org Sekolah Murid Merdeka,
+  // tulis ringkasan ke tab Sheet1 sheet Data Kode Voucher SID) - langsung jalan, gak perlu
+  // konfirmasi. Cepat (~430 campaign, beberapa page call doang).
+  bot.onText(/^\/exportvoucher(?:@\w+)?(?:\s+(\S+))?$/, async (msg) => {
+    const chatId = msg.chat.id;
+    const fromId = msg.from?.id;
+
+    if (msg.chat.type !== 'private') {
+      return bot.sendMessage(chatId, 'Command ini cuma bisa dipakai lewat chat pribadi (DM) ke bot, biar token gak ke-expose ke grup.');
+    }
+    if (!isSidCoreAllowedUser(fromId)) {
+      return bot.sendMessage(chatId, 'Kamu belum diizinkan pakai command ini.');
+    }
+    if (isRunning(chatId)) {
+      return bot.sendMessage(chatId, 'Masih ada proses SID Core lain yang jalan buat kamu, tunggu selesai dulu ya.');
+    }
+
+    const match = msg.text.match(/^\/\w+(?:@\w+)?\s+(\S+)/);
+    const token = match?.[1];
+    if (!token) {
+      return bot.sendMessage(chatId, 'Kirim tokennya juga ya, format:\n/exportvoucher <SID_CORE_TOKEN>');
+    }
+
+    runningChats.add(chatId);
+    try {
+      await bot.sendMessage(chatId, 'Export semua kode voucher/diskon (Sekolah Murid Merdeka) ke sheet...');
+      const { code, output } = await runScript('export-vouchers.js', token, false);
+      await bot.sendMessage(chatId, truncate(output || '(kosong)'));
+      await bot.sendMessage(chatId, code === 0 ? 'Selesai.' : 'Ada error, cek log di atas.');
+    } finally {
+      runningChats.delete(chatId);
+    }
+  });
+
+  // export-voucher-rules.js: non-destruktif (baca Aturan Diskon SETIAP campaign, tulis ke tab
+  // "Aturan Diskon" sheet yang sama) - langsung jalan, gak perlu konfirmasi. LAMBAT (430
+  // campaign x fetch detail = sekitar 25-30 menit, dites langsung 2026-08-07) - pakai timeout
+  // custom 40 menit (lebih panjang dari TIMEOUT_MS default 15 menit) biar gak kepotong SEBELUM
+  // sempat nulis ke sheet (script-nya nulis SEKALI DI AKHIR, bukan incremental - kalau timeout
+  // duluan, sheet gak keupdate sama sekali).
+  bot.onText(/^\/exportvoucherrules(?:@\w+)?(?:\s+(\S+))?$/, async (msg) => {
+    const chatId = msg.chat.id;
+    const fromId = msg.from?.id;
+
+    if (msg.chat.type !== 'private') {
+      return bot.sendMessage(chatId, 'Command ini cuma bisa dipakai lewat chat pribadi (DM) ke bot, biar token gak ke-expose ke grup.');
+    }
+    if (!isSidCoreAllowedUser(fromId)) {
+      return bot.sendMessage(chatId, 'Kamu belum diizinkan pakai command ini.');
+    }
+    if (isRunning(chatId)) {
+      return bot.sendMessage(chatId, 'Masih ada proses SID Core lain yang jalan buat kamu, tunggu selesai dulu ya.');
+    }
+
+    const match = msg.text.match(/^\/\w+(?:@\w+)?\s+(\S+)/);
+    const token = match?.[1];
+    if (!token) {
+      return bot.sendMessage(chatId, 'Kirim tokennya juga ya, format:\n/exportvoucherrules <SID_CORE_TOKEN>\n\nCatatan: token cuma valid ~1 jam, tapi proses ini butuh sekitar 25-30 menit - kalau token keburu expired di tengah jalan, tinggal ambil token baru dan jalanin ulang.');
+    }
+
+    runningChats.add(chatId);
+    try {
+      await bot.sendMessage(chatId, 'Export semua Aturan Diskon tiap campaign/voucher (Sekolah Murid Merdeka) ke sheet - ini PROSES LAMA (~25-30 menit, 430 campaign), sabar ya, nanti dikabarin kalau udah selesai...');
+      const { code, output } = await runScript('export-voucher-rules.js', token, false, [], 40 * 60 * 1000);
       await bot.sendMessage(chatId, truncate(output || '(kosong)'));
       await bot.sendMessage(chatId, code === 0 ? 'Selesai.' : 'Ada error, cek log di atas.');
     } finally {
