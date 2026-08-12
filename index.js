@@ -44,9 +44,43 @@ function saveGroups() {
   groupsDb.transaction(() => extra.forEach(id => ins.run(id)))();
 }
 
-// ─── Startup: bersihkan webhook & pending updates ─────────────────────────────
+// ─── Startup: bersihkan webhook & pending updates (kondisional berdasar lama downtime) ─
+// Restart cepat (abis deploy) -> drop pending updates spy gak reprocess backlog dev.
+// Downtime panjang (outage VPS dkk) -> JANGAN drop, biar pesan yang numpuk selama
+// bot down tetap keproses begitu online lagi (dulu selalu drop, jadi pesan hilang
+// diam-diam kalau outage lama — insiden 2026-08-12).
 console.log('Starting up...');
-await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook?drop_pending_updates=true`).catch(() => {});
+groupsDb.exec("CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value TEXT)");
+const HEARTBEAT_KEY = 'last_heartbeat_at';
+const QUICK_RESTART_THRESHOLD_MS = 5 * 60 * 1000;
+function getHeartbeat() {
+  const row = groupsDb.prepare('SELECT value FROM bot_state WHERE key = ?').get(HEARTBEAT_KEY);
+  return row ? parseInt(row.value, 10) : null;
+}
+function setHeartbeat(ts) {
+  groupsDb.prepare(
+    'INSERT INTO bot_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+  ).run(HEARTBEAT_KEY, String(ts));
+}
+
+const lastHeartbeat = getHeartbeat();
+const now = Date.now();
+const downtimeMs = lastHeartbeat ? now - lastHeartbeat : null;
+const isQuickRestart = downtimeMs !== null && downtimeMs < QUICK_RESTART_THRESHOLD_MS;
+
+if (isQuickRestart) {
+  console.log(`[startup] Restart cepat (down ${Math.round(downtimeMs / 1000)}s) — drop pending updates.`);
+  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook?drop_pending_updates=true`).catch(() => {});
+} else {
+  if (lastHeartbeat) {
+    console.log(`[startup] Downtime lama (${Math.round(downtimeMs / 60000)} menit) — pending updates DIPERTAHANKAN, akan diproses.`);
+  } else {
+    console.log('[startup] Belum ada heartbeat sebelumnya (first run) — pending updates dipertahankan.');
+  }
+  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook`).catch(() => {});
+}
+setHeartbeat(now);
+
 await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates`, {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
@@ -57,6 +91,10 @@ await new Promise(r => setTimeout(r, 2000));
 const bot = new TelegramBot(BOT_TOKEN, {
   polling: { interval: 1000, params: { allowed_updates: ['message', 'callback_query', 'edited_message'], timeout: 10 } },
 });
+
+setInterval(() => setHeartbeat(Date.now()), 60_000);
+process.on('SIGTERM', () => { setHeartbeat(Date.now()); process.exit(0); });
+process.on('SIGINT', () => { setHeartbeat(Date.now()); process.exit(0); });
 
 const client = new OpenAI({ apiKey: DEEPSEEK_API_KEY, baseURL: 'https://api.deepseek.com', maxRetries: 1, timeout: 60_000 });
 
@@ -480,7 +518,7 @@ bot.onText(/^\/(start|help)(?:@\w+)?$/, async (msg) => {
   if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
   paused = false;
   const sidCoreSection = msg.chat.type === 'private'
-    ? `\n\n*SID Core automation* (DM only)\n_Token: core.sid.id → F12 → Network → api.sid.id → Authorization_\n\n*👤 Pengguna & Role*\n🧹 /resign — rename akun resign\n✏️ /updateuser — ubah data user\n👥 /updaterole — assign peran ke platform\n🛡️ /role — bikin role baru dari sheet\n\n*📚 Program*\n➕ /addprogram — tambah peserta\n🗑️ /removeprogram — hapus peserta\n🧑‍🏫 /addpic — tambah PIC\n👨‍👩‍👧 /kelompok — kelola Kelompok Program\n🔍 /checkprogram — cek detail ID Program\n\n*🏛️ Platform*\n🔗 /platformorg — kaitkan/lepas Organisasi\n🔗 /platformrole — kaitkan/lepas Role\n\n*🏷️ Voucher Diskon*\n✏️ /voucher — edit aturan diskon campaign existing\n🆕 /newvoucher — bikin campaign voucher baru\n\n*📋 Export & Sync*\n📋 /exportroles — semua role\n📄 /exportdeskripsi — Type/Scope/Deskripsi ke tab Role\n🧩 /rekonrole — cocokkan Role Code + tab Usulan Katalog Role\n🏢 /exportorg — semua organisasi\n📖 /exportkelompok — ID Kelompok per program\n🏛️ /exportplatform — org & role tiap platform\n🔄 /synctemplate — sync fitur terbaru\n\n_Semua command: ketik /nama-command <token>_`
+    ? `\n\n*SID Core automation* (DM only)\n_Token: core.sid.id → F12 → Network → api.sid.id → Authorization_\n\n*👤 Pengguna & Role*\n🧹 /resign — rename akun resign\n✏️ /updateuser — ubah data user\n👥 /updaterole — assign peran ke platform\n🛡️ /role — bikin role baru dari sheet\n📝 /editrole — ubah nama/permission role existing\n\n*📚 Program*\n➕ /addprogram — tambah peserta\n🗑️ /removeprogram — hapus peserta\n🧑‍🏫 /addpic — tambah PIC\n👨‍👩‍👧 /kelompok — kelola Kelompok Program\n🔍 /checkprogram — cek detail ID Program\n\n*🏛️ Platform*\n🔗 /platformorg — kaitkan/lepas Organisasi\n🔗 /platformrole — kaitkan/lepas Role\n\n*🏷️ Voucher Diskon*\n✏️ /voucher — edit aturan diskon campaign existing\n🆕 /newvoucher — bikin campaign voucher baru\n\n*📋 Export & Sync*\n📋 /exportroles — semua role\n📄 /exportdeskripsi — Type/Scope/Deskripsi ke tab Role\n🧩 /rekonrole — cocokkan Role Code + tab Usulan Katalog Role\n🏢 /exportorg — semua organisasi\n📖 /exportkelompok — ID Kelompok per program\n🏛️ /exportplatform — org & role tiap platform\n🏷️ /exportvoucher — semua kode voucher/diskon\n📐 /exportvoucherrules — aturan diskon tiap voucher (~25-30 menit)\n🔄 /synctemplate — sync fitur terbaru\n\n_Semua command: ketik /nama-command <token>_`
     : '';
   await bot.sendMessage(msg.chat.id,
     `Haloo! Gue *Sobat Product* 👋\n\nGue bisa:\n🗓️ Ngecek data tim (ultah, event, gajian)\n📝 Bantu brainstorm, PRD, problem framing\n💬 Diskusi product, debat, ngelucu\n📁 Baca PDF, DOCX, atau gambar yang lo kirimin\n🔍 /muv <pertanyaan> — analisa cepat data MUV\n\n(Kerja langsung di MUV — bikin/pindah/assign task, reminder — sekarang lewat @letsmuvbot ya, biar gak nyampur)${sidCoreSection}\n\nMention atau reply pesan gue buat ngobrol!`,
