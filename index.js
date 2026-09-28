@@ -8,7 +8,6 @@ import path from 'path';
 import { initGoogle } from './sheets.js';
 import { initScheduler } from './scheduler.js';
 import { isTriggerKeyword } from './triggers.js';
-import { registerSidCoreCommands, handleSidCorePendingReply } from './sidcoreCommands.js';
 
 const require = createRequire(import.meta.url);
 const pdfParse = require('pdf-parse');
@@ -21,7 +20,6 @@ const OCR_SERVICE_URL    = process.env.OCR_SERVICE_URL || 'http://ocr-service:30
 const ALLOWED_GROUP_IDS_ENV = process.env.ALLOWED_GROUP_IDS?.split(',').map(Number).filter(Boolean) || [];
 const ALLOWED_USER_IDS   = process.env.ALLOWED_USER_IDS?.split(',').map(Number).filter(Boolean) || [];
 const ADMIN_IDS          = [parseInt(process.env.ADMIN_NOTIFY_CHAT_ID || '0')].filter(Boolean);
-const SID_CORE_ALLOWED_USER_IDS = process.env.SID_CORE_ALLOWED_USER_IDS?.split(',').map(Number).filter(Boolean) || [];
 const ADMIN_NOTIFY_TOKEN = process.env.ADMIN_NOTIFY_TOKEN || '';
 const ADMIN_NOTIFY_CHAT_ID = parseInt(process.env.ADMIN_NOTIFY_CHAT_ID || '0');
 const CREDENTIALS_FILE   = process.env.GOOGLE_CREDENTIALS_FILE || '/app/google-credentials.json';
@@ -507,22 +505,13 @@ async function handleMessage(chatId, userContent, replyTo, fromId) {
 const isAllowedGroup = id => allowedGroupIds.includes(id);
 const isAllowedUser  = id => ALLOWED_USER_IDS.length === 0 || ALLOWED_USER_IDS.includes(id);
 const isAdmin        = id => ADMIN_IDS.includes(id);
-// Kosong = semua orang boleh (sama kayak ALLOWED_USER_IDS) - keputusan tim 2026-07-17.
-// Proteksi tetap ada di level command: DM-only + wajib dry-run + konfirmasi eksplisit sebelum --execute.
-const isSidCoreAllowedUser = id => SID_CORE_ALLOWED_USER_IDS.length === 0
-  || SID_CORE_ALLOWED_USER_IDS.includes(id);
-
-registerSidCoreCommands(bot, { isSidCoreAllowedUser });
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
 bot.onText(/^\/(start|help)(?:@\w+)?$/, async (msg) => {
   if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id) && !isAllowedUser(msg.from?.id)) return;
   paused = false;
-  const sidCoreSection = msg.chat.type === 'private'
-    ? `\n\n*SID Core automation* (DM only)\n_Token: core.sid.id → F12 → Network → api.sid.id → Authorization_\n\n*👤 Pengguna & Role*\n🧹 /resign — rename akun resign\n✏️ /updateuser — ubah data user\n👥 /updaterole — assign peran ke platform\n🛡️ /role — bikin role baru dari sheet\n📝 /editrole — ubah nama/permission role existing\n\n*📚 Program*\n🆕 /buatprogram — bikin Program baru dari nol\n📄 /tambahaktivitas — tambah Activity ke Program (baru support tipe Teks)\n📑 /tambahtopic — tambah Topic/Chapter ke Program\n🧬 /duplicateprogram — duplicate Program existing jadi Program baru (lengkap Topic+Activity)\n🧬 /duplicatekerangka — duplicate BANYAK Program sekaligus dari tabel (batch)\n➕ /addprogram — tambah peserta\n🗑️ /removeprogram — hapus peserta\n🧑‍🏫 /addpic — tambah PIC\n👨‍👩‍👧 /kelompok — kelola Kelompok Program\n🔍 /checkprogram — cek detail ID Program\n📊 /exportprogramparent — export peserta + nilai kuis/tugas 5 Program Parent SMM (sheet tetap, feed dashboard)\n📊 /exportprogram — sama tapi buat program LAIN (sheet umum terpisah)\n\n*🏛️ Platform*\n🔗 /platformorg — kaitkan/lepas Organisasi\n🔗 /platformrole — kaitkan/lepas Role\n\n*🏷️ Voucher Diskon*\n✏️ /voucher — edit aturan diskon campaign existing\n🆕 /newvoucher — bikin campaign voucher baru\n➕ /updateproduk — tambah aturan diskon baru ke produk (boleh produk sama, periode beda)\n\n*📋 Export & Sync*\n📋 /exportroles — semua role\n📄 /exportdeskripsi — Type/Scope/Deskripsi ke tab Role\n🧩 /rekonrole — cocokkan Role Code + tab Usulan Katalog Role\n🏢 /exportorg — semua organisasi\n📍 /exportlokasi — semua lokasi belajar\n🧠 /exportbo — Bank Kompetensi (BO), per organisasi: /exportbo <token> [org id] (6=Sekolah Cikal, 5=SMM)\n📖 /exportkelompok — ID Kelompok per program\n🏛️ /exportplatform — org & role tiap platform\n🏷️ /exportvoucher — semua kode voucher/diskon\n📐 /exportvoucherrules — aturan diskon 1 voucher: /exportvoucherrules <token> <org_id> <kode> (org: 5=SMM prod, 612=staging)\n🔄 /synctemplate — sync fitur terbaru\n\n*🧾 Paket Belajar*\n📉 /cekcicilan — audit cicilan nonaktif padahal skemanya Penuh/Cicilan: /cekcicilan <token> [org_id] (default org 5=SMM)\n\n_Semua command: ketik /nama-command <token>_`
-    : '';
   await bot.sendMessage(msg.chat.id,
-    `Haloo! Gue *Sobat Product* 👋\n\nGue bisa:\n🗓️ Ngecek data tim (ultah, event, gajian)\n📝 Bantu brainstorm, PRD, problem framing\n💬 Diskusi product, debat, ngelucu\n📁 Baca PDF, DOCX, atau gambar yang lo kirimin\n🔍 /muv <pertanyaan> — analisa cepat data MUV\n\n(Kerja langsung di MUV — bikin/pindah/assign task, reminder — sekarang lewat @letsmuvbot ya, biar gak nyampur)${sidCoreSection}\n\nMention atau reply pesan gue buat ngobrol!`,
+    `Haloo! Gue *Sobat Product* 👋\n\nGue bisa:\n🗓️ Ngecek data tim (ultah, event, gajian)\n📝 Bantu brainstorm, PRD, problem framing\n💬 Diskusi product, debat, ngelucu\n📁 Baca PDF, DOCX, atau gambar yang lo kirimin\n🔍 /muv <pertanyaan> — analisa cepat data MUV\n\n(Kerja langsung di MUV — bikin/pindah/assign task, reminder — sekarang lewat @letsmuvbot ya, biar gak nyampur)\n\nMention atau reply pesan gue buat ngobrol!`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -532,7 +521,6 @@ bot.onText(/^\/reset(?:@\w+)?$/, async (msg) => {
   conversations.delete(msg.chat.id);
   await bot.sendMessage(msg.chat.id, 'Chat direset. Fresh start!');
 });
-
 
 bot.onText(/^\/loud(?:@\w+)?$/, async (msg) => {
   if (!isAdmin(msg.from?.id)) return;
@@ -593,7 +581,6 @@ bot.onText(/^\/listgroups(?:@\w+)?$/, async (msg) => {
     { parse_mode: 'Markdown' }
   );
 });
-
 
 // ─── File extraction helpers ──────────────────────────────────────────────────
 async function downloadFile(fileId) {
@@ -663,7 +650,6 @@ bot.on("message", async (msg) => {
   if (text && text.startsWith('/')) return;
 
   // ─── SID Core automation: konfirmasi "ya"/"batal" kalau ada pending dry-run ───
-  if (text && chatType === 'private' && await handleSidCorePendingReply(bot, msg)) return;
 
   // ─── File handler ───
   const hasFile = !!msg.photo || !!msg.document;
@@ -714,7 +700,6 @@ bot.on("message", async (msg) => {
   // ─── Text handler ───
   if (!text) return;
   if (paused && !isAdmin(fromId)) { console.log('[msg] blocked: paused'); return; }
-
 
   if (chatType === 'private') {
     if (!isAllowedUser(fromId) && !isAdmin(fromId)) { console.log('[msg] blocked: private not allowed'); return; }

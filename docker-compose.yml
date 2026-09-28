@@ -1,17 +1,30 @@
+# ⚠️ RETIRED — 28 Sep 2026. JANGAN `docker compose up` LAGI.
+#
+# Bot Docker ini sudah dipensiunkan dan DIGANTIKAN oleh Hermes Agent:
+#   profil `sobatproduct`  →  systemd user unit `hermes-gateway-sobatproduct.service`
+#   (~/.hermes/profiles/sobatproduct, bot Telegram @sobatproductbot yang sama)
+#
+# Kenapa jangan di-up lagi:
+#   1. Token Telegram @sobatproductbot SEKARANG dipegang gateway Hermes. Kalau container
+#      ini dinyalakan, dua proses akan rebutan getUpdates → 409 CONFLICT storm
+#      (persis insiden 19–28 Sep 2026: 283rb baris log, bot praktis mati).
+#   2. Surface otomasi SID Core sudah dilepas dari repo ini (sidcoreCommands.js dihapus).
+#      Otomasi SID Core sekarang lewat web `robot.product-sid.us/semesta` + sheet tim.
+#
+# Cara balik kalau benar-benar perlu bot lama lagi (mis. Hermes bermasalah):
+#   matikan dulu gateway Hermes → `systemctl --user stop hermes-gateway-sobatproduct.service`
+#   pulihkan file: `git checkout <commit-sebelum-2026-09-28> -- sidcoreCommands.js index.js`
+#   baru `docker compose up -d --build`
 services:
   sobatproduct:
     build: .
     container_name: sobatproduct
-    restart: unless-stopped
+    restart: "no"
     env_file: .env
     volumes:
       - ./index.js:/app/index.js
-      - ./sidcoreCommands.js:/app/sidcoreCommands.js
       - ./google-credentials.json:/app/google-credentials.json:ro
       - ./data:/app/data
-      - /home/product/sid-core-automation:/app/sid-core-automation:ro
-      - /home/product/role-dashboard/data/role-descriptions.json:/app/role-descriptions.json
-      - /home/product/role-dashboard/data/role-code-mapping.json:/app/role-code-mapping.json
     networks:
       - proxy
 
