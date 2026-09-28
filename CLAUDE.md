@@ -57,4 +57,26 @@ Profile Hermes yang baru ada di `/home/product/.hermes/profiles/sobatproduct/` (
 **Kesimpulan:** bot production yang aktif SEKARANG = Docker bot lama di repo ini. Hermes masih private testing, belum cutover. Jangan asumsikan Hermes sudah menggantikan apapun di sini sampai ada konfirmasi eksplisit — cek dulu status container `sobatproduct` (`docker ps`) dan token yang dipakai kalau ragu.
 
 ## Lab Notes
-belum ada entri
+
+### 2026-09-11 — Notif "🟢 Sobat Product online." berulang (diperbaiki)
+Keluhan user: bot nge-spam notif online padahal bukan kita yang restart. Penyebab: `bot.on('polling_error')` memanggil `process.exit(1)` untuk **semua** error `EFATAL` (jaringan/bentrok getUpdates), bukan cuma error fatal beneran → Docker (`restart: unless-stopped`) nyalain ulang container → tiap start kirim notif (18x exit dalam 1 log; notif tercatat 10–12 Sep).
+Perbaikan di `index.js`:
+1. EFATAL/konflik di-**retry in-process** (`stopPolling` → jeda 5s → `startPolling({restart:true})`); `process.exit(1)` cuma kalau gagal 2x dalam 5 menit (Docker tetap jaring terakhir, dan itu pun senyap).
+2. **Notif online bergerbang**: hanya dikirim kalau `data/notify-online` ada (marker dikonsumsi/dihapus setelah dibaca) atau env `STARTUP_NOTIFY=1`. Auto-restart Docker = senyap → `[startup] mode SENYAP` di log.
+3. Pesan error asli sekarang **di-log + disimpan** ke tabel `bot_state` key `last_polling_error` (sebelumnya ditelan, jadi sebab EFATAL tak terlacak). Error `409/Conflict` tidak lagi bikin exit (exit cuma memperparah loop; penyebabnya instance lain pakai token yang sama).
+Cara restart yang benar sekarang: `scripts/restart-bot.sh` (bikin marker + `docker compose restart`, kirim notif) atau `NOTIFY=0 ./scripts/restart-bot.sh` (senyap). Backup: `index.js.bak-20260911-notifonline`.
+Catatan: `index.js` owner `ican:product` (bukan product) → edit harus lewat docker mount + `chown 1000:1000`. Service `hermes-gateway-sobatproduct.service` (user systemd) sudah **failed & disabled** sejak 2026-09-09 — bukan pemicu konflik token.
+
+### 2026-09-28 — 409 CONFLICT storm 9 hari: retry polling numpuk 16 loop (diperbaiki)
+Gejala: log container `sobatproduct` berisi **283.542 baris** `[polling] 409 CONFLICT — ada instance lain pakai token ini` (mulai 19 Sep 2026 23:34 WIB), bot praktis nggak nerima pesan.
+Diagnosa: **bukan** instance lain di luar container. Bukti dari dalam container — proses node (PID 1) pegang **16 socket ESTABLISHED** ke `149.154.166.110:443` (api.telegram.org); bot sehat cuma 1 (long-poll) + sesekali 1 request lain.
+Akar masalah: fix 2026-09-11 memakai `bot.stopPolling({cancel:true})` lalu `startPolling({restart:true})`. Di `node-telegram-bot-api@0.66`, `stop({cancel:true})` hanya membatalkan request yang jalan dan **tidak** men-set `_abort`; loop lama karena itu menjadwalkan dirinya lagi di `.finally()` (`src/telegramPolling.js` baris 58-74 vs 163-170). Tiap recovery EFATAL ⇒ +1 loop, loop-loop itu saling bertabrakan (409) tapi kode 09-11 sengaja membuat 409 tidak fatal ⇒ numpuk tanpa henti sampai 16 loop.
+Perbaikan di `index.js`:
+1. `stopPollingCleanly()` → `bot.stopPolling()` **tanpa** `cancel` (men-set `_abort=true`), lalu tunggu `bot.isPolling()` benar-benar `false` sebelum start ulang. Ini yang menghentikan penumpukan loop.
+2. 409 sekarang **dieskalasi**: throttle log 30s (dulu 283rb baris), dan kalau >20 konflik dalam 10 menit ⇒ `exit(1)` supaya Docker menyalakan proses **bersih dengan 1 poller** (senyap, tanpa notif). Ada cooldown 20 menit (`bot_state.last_poll_clean_restart`) supaya tidak jadi restart-storm kalau ternyata benar-benar ada instance luar.
+3. Marker `bot_state.last_poll_clean_restart` disimpan di `data/groups.db`.
+Verifikasi setelah restart: 1 proses node, **2 socket** ke Telegram (bukan 16), **0** log 409, dan probe `getUpdates` dari luar balas `409 Conflict` (artinya container inilah pemegang slot polling = bot hidup & satu-satunya).
+Backup: `~/.backups/sobatproduct/index.js.20260928-pollfix` (sha256 `ccda2912…`).
+Catatan hygiene: `data/groups.db*` akhirnya **di-untrack** dari git (`git rm --cached`, masuk `.gitignore`) — file runtime SQLite never should be in git; `scripts/` (berisi `restart-bot.sh`) di-commit.
+Catatan akses: alias SSH `github-sobatproduct` **hilang** dari `~/.ssh/config` ⇒ `git fetch/push` ke `origin` gagal (hostname tak resolve). Sementara push dilakukan via `GIT_SSH_COMMAND` + key yang ada.
+

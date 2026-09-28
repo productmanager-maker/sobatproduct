@@ -2,6 +2,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import OpenAI from 'openai';
 import { google } from 'googleapis';
 import fs from 'fs/promises';
+import fsSync from 'node:fs'; // cek/hapus marker notif-online (lihat blok polling di bawah)
 import { createRequire } from 'module';
 import path from 'path';
 import { initGoogle } from './sheets.js';
@@ -254,12 +255,12 @@ async function handleMuvQuery(chatId, fromId, username, question, replyTo) {
 }
 
 bot.onText(/^\/muv(?:@\w+)?\s+([\s\S]+)/, async (msg, match) => {
-  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id) && !isAllowedUser(msg.from?.id)) return;
   await handleMuvQuery(msg.chat.id, msg.from.id, msg.from?.username, match[1].trim(), msg.message_id);
 });
 
 bot.onText(/^\/muv(?:@\w+)?$/, async (msg) => {
-  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id) && !isAllowedUser(msg.from?.id)) return;
   await bot.sendMessage(msg.chat.id, 'Pakai gini: /muv <pertanyaan>\n\nContoh: /muv ada temuan riset apa soal onboarding?\n\nBuat kerja langsung di MUV (bikin/pindah/assign task, reminder), pakai @letsmuvbot ya.');
 });
 
@@ -515,10 +516,10 @@ registerSidCoreCommands(bot, { isSidCoreAllowedUser });
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
 bot.onText(/^\/(start|help)(?:@\w+)?$/, async (msg) => {
-  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id) && !isAllowedUser(msg.from?.id)) return;
   paused = false;
   const sidCoreSection = msg.chat.type === 'private'
-    ? `\n\n*SID Core automation* (DM only)\n_Token: core.sid.id → F12 → Network → api.sid.id → Authorization_\n\n*👤 Pengguna & Role*\n🧹 /resign — rename akun resign\n✏️ /updateuser — ubah data user\n👥 /updaterole — assign peran ke platform\n🛡️ /role — bikin role baru dari sheet\n📝 /editrole — ubah nama/permission role existing\n\n*📚 Program*\n➕ /addprogram — tambah peserta\n🗑️ /removeprogram — hapus peserta\n🧑‍🏫 /addpic — tambah PIC\n👨‍👩‍👧 /kelompok — kelola Kelompok Program\n🔍 /checkprogram — cek detail ID Program\n\n*🏛️ Platform*\n🔗 /platformorg — kaitkan/lepas Organisasi\n🔗 /platformrole — kaitkan/lepas Role\n\n*🏷️ Voucher Diskon*\n✏️ /voucher — edit aturan diskon campaign existing\n🆕 /newvoucher — bikin campaign voucher baru\n\n*📋 Export & Sync*\n📋 /exportroles — semua role\n📄 /exportdeskripsi — Type/Scope/Deskripsi ke tab Role\n🧩 /rekonrole — cocokkan Role Code + tab Usulan Katalog Role\n🏢 /exportorg — semua organisasi\n📖 /exportkelompok — ID Kelompok per program\n🏛️ /exportplatform — org & role tiap platform\n🏷️ /exportvoucher — semua kode voucher/diskon\n📐 /exportvoucherrules — aturan diskon tiap voucher (~25-30 menit)\n🔄 /synctemplate — sync fitur terbaru\n\n_Semua command: ketik /nama-command <token>_`
+    ? `\n\n*SID Core automation* (DM only)\n_Token: core.sid.id → F12 → Network → api.sid.id → Authorization_\n\n*👤 Pengguna & Role*\n🧹 /resign — rename akun resign\n✏️ /updateuser — ubah data user\n👥 /updaterole — assign peran ke platform\n🛡️ /role — bikin role baru dari sheet\n📝 /editrole — ubah nama/permission role existing\n\n*📚 Program*\n🆕 /buatprogram — bikin Program baru dari nol\n📄 /tambahaktivitas — tambah Activity ke Program (baru support tipe Teks)\n📑 /tambahtopic — tambah Topic/Chapter ke Program\n🧬 /duplicateprogram — duplicate Program existing jadi Program baru (lengkap Topic+Activity)\n🧬 /duplicatekerangka — duplicate BANYAK Program sekaligus dari tabel (batch)\n➕ /addprogram — tambah peserta\n🗑️ /removeprogram — hapus peserta\n🧑‍🏫 /addpic — tambah PIC\n👨‍👩‍👧 /kelompok — kelola Kelompok Program\n🔍 /checkprogram — cek detail ID Program\n📊 /exportprogramparent — export peserta + nilai kuis/tugas 5 Program Parent SMM (sheet tetap, feed dashboard)\n📊 /exportprogram — sama tapi buat program LAIN (sheet umum terpisah)\n\n*🏛️ Platform*\n🔗 /platformorg — kaitkan/lepas Organisasi\n🔗 /platformrole — kaitkan/lepas Role\n\n*🏷️ Voucher Diskon*\n✏️ /voucher — edit aturan diskon campaign existing\n🆕 /newvoucher — bikin campaign voucher baru\n➕ /updateproduk — tambah aturan diskon baru ke produk (boleh produk sama, periode beda)\n\n*📋 Export & Sync*\n📋 /exportroles — semua role\n📄 /exportdeskripsi — Type/Scope/Deskripsi ke tab Role\n🧩 /rekonrole — cocokkan Role Code + tab Usulan Katalog Role\n🏢 /exportorg — semua organisasi\n📍 /exportlokasi — semua lokasi belajar\n🧠 /exportbo — Bank Kompetensi (BO), per organisasi: /exportbo <token> [org id] (6=Sekolah Cikal, 5=SMM)\n📖 /exportkelompok — ID Kelompok per program\n🏛️ /exportplatform — org & role tiap platform\n🏷️ /exportvoucher — semua kode voucher/diskon\n📐 /exportvoucherrules — aturan diskon 1 voucher: /exportvoucherrules <token> <org_id> <kode> (org: 5=SMM prod, 612=staging)\n🔄 /synctemplate — sync fitur terbaru\n\n*🧾 Paket Belajar*\n📉 /cekcicilan — audit cicilan nonaktif padahal skemanya Penuh/Cicilan: /cekcicilan <token> [org_id] (default org 5=SMM)\n\n_Semua command: ketik /nama-command <token>_`
     : '';
   await bot.sendMessage(msg.chat.id,
     `Haloo! Gue *Sobat Product* 👋\n\nGue bisa:\n🗓️ Ngecek data tim (ultah, event, gajian)\n📝 Bantu brainstorm, PRD, problem framing\n💬 Diskusi product, debat, ngelucu\n📁 Baca PDF, DOCX, atau gambar yang lo kirimin\n🔍 /muv <pertanyaan> — analisa cepat data MUV\n\n(Kerja langsung di MUV — bikin/pindah/assign task, reminder — sekarang lewat @letsmuvbot ya, biar gak nyampur)${sidCoreSection}\n\nMention atau reply pesan gue buat ngobrol!`,
@@ -527,7 +528,7 @@ bot.onText(/^\/(start|help)(?:@\w+)?$/, async (msg) => {
 });
 
 bot.onText(/^\/reset(?:@\w+)?$/, async (msg) => {
-  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id) && !isAllowedUser(msg.from?.id)) return;
   conversations.delete(msg.chat.id);
   await bot.sendMessage(msg.chat.id, 'Chat direset. Fresh start!');
 });
@@ -543,7 +544,7 @@ bot.onText(/^\/loud(?:@\w+)?$/, async (msg) => {
 });
 
 bot.onText(/^\/status(?:@\w+)?$/, async (msg) => {
-  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id)) return;
+  if (!isAllowedGroup(msg.chat.id) && !isAdmin(msg.from?.id) && !isAllowedUser(msg.from?.id)) return;
   await bot.sendMessage(msg.chat.id,
     `*Sobat Product Status*\n🤖 Processing: ${processing.has(msg.chat.id) ? 'ya' : 'idle'}\n💬 History: ${conversations.get(msg.chat.id)?.length || 0} pesan\n📊 Sheets: ${sheetsClient ? '✅' : '❌'}\n🔊 Loud: ${loudGroups.has(msg.chat.id) ? 'ON' : 'OFF (mention/reply only)'}`,
     { parse_mode: 'Markdown' }
@@ -750,16 +751,161 @@ bot.on("message", async (msg) => {
   }
 });
 
-bot.on('polling_error', (err) => {
-  if (err.message.includes('409')) return;
-  if (err.message.includes('EFATAL')) {
-    console.error('[polling] EFATAL — exiting for Docker restart');
-    process.exit(1);
+// ─── Polling error + notif online ────────────────────────────────────────────
+// Riwayat perbaikan:
+// 2026-09-11 — notif "🟢 Sobat Product online." muncul berulang padahal bukan
+//   kita yang restart. Penyebab: SEMUA error EFATAL langsung `process.exit(1)`
+//   → Docker (restart: unless-stopped) nyalain ulang → notif lagi (18x kejadian).
+//   Fix: EFATAL di-retry in-process + notif online BERGerbang (marker
+//   data/notify-online dari scripts/restart-bot.sh, atau env STARTUP_NOTIFY=1).
+// 2026-09-28 — 🐞 BUG: cara retry-nya sendiri malah MENUMPUK LOOPS.
+//   node-telegram-bot-api 0.66 `stopPolling({cancel:true})` cuma membatalkan
+//   request yang sedang jalan, TIDAK men-set `_abort` → di `.finally()` loop
+//   lama menjadwalkan dirinya sendiri lagi 1 detik kemudian (bandingkan
+//   src/telegramPolling.js stop() baris 58-74 vs _polling() .finally() 163-170).
+//   Jadi tiap recovery +1 loop; loop-loop itu saling "terminated by other
+//   getUpdates request" (409) tapi kode 09-11 sengaja bikin 409 tidak fatal →
+//   numpuk terus sampai 16 koneksi paralel ke api.telegram.org, 283.542 baris
+//   log 409 (19-28 Sep 2026), dan bot praktis nggak nerima pesan.
+//   Fix: (a) teardown lewat `stopPolling()` TANPA cancel → set `_abort=true`
+//   sehingga loop lama benar-benar berhenti sebelum start ulang;
+//   (b) 409 sekarang dieskalasi: kalau tetap deras → exit(1) supaya Docker
+//   kasih proses BERSIH dengan 1 poller, pakai cooldown anti restart-storm;
+//   (c) log 409 di-throttle (30s) biar nggak membanjiri log lagi.
+//   Notif online tetap bergerbang: hanya saat restart memang dari kita.
+const NOTIFY_MARKER = '/app/data/notify-online';
+function notifyRequested() {
+  if (process.env.STARTUP_NOTIFY === '1') return 'env STARTUP_NOTIFY=1';
+  try {
+    if (fsSync.existsSync(NOTIFY_MARKER)) {
+      fsSync.unlinkSync(NOTIFY_MARKER);
+      return 'marker data/notify-online';
+    }
+  } catch (e) {}
+  return null;
+}
+function recordPollError(msg) {
+  try {
+    groupsDb
+      .prepare('INSERT INTO bot_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .run('last_polling_error', new Date().toISOString() + ' ' + msg);
+  } catch (e) {}
+}
+function botStateSet(key, value) {
+  try {
+    groupsDb
+      .prepare('INSERT INTO bot_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .run(key, value);
+  } catch (e) {}
+}
+function botStateGet(key) {
+  try {
+    const row = groupsDb.prepare('SELECT value FROM bot_state WHERE key = ?').get(key);
+    return row ? row.value : null;
+  } catch (e) { return null; }
+}
+
+// Teardown polling yang BENAR: tanpa `cancel`, supaya _abort=true dan loop lama
+// tidak menjadwalkan dirinya lagi. `cancel:true` = sumber bug 16-loop di atas.
+async function stopPollingCleanly() {
+  try { await bot.stopPolling(); } catch (e) {}
+  for (let i = 0; i < 6; i++) {
+    let aktif = false;
+    try { aktif = typeof bot.isPolling === 'function' && bot.isPolling(); } catch (e) {}
+    if (!aktif) return true;
+    await new Promise((r) => setTimeout(r, 1000));
   }
-  console.error('[polling_error]', err.message);
+  return false;
+}
+
+let lastPollRecoveryAt = 0;
+let pollRecoveryCount = 0;
+let recoveringPoll = false;
+async function recoverPolling(reason) {
+  if (recoveringPoll) return;
+  recoveringPoll = true;
+  try {
+    const now = Date.now();
+    if (now - lastPollRecoveryAt > 5 * 60 * 1000) pollRecoveryCount = 0;
+    pollRecoveryCount++;
+    lastPollRecoveryAt = now;
+    recordPollError(reason);
+    console.error('[polling] error (' + pollRecoveryCount + 'x dlm 5 mnt): ' + reason);
+
+    if (pollRecoveryCount >= 2) {
+      console.error('[polling] gagal berulang — exit(1) biar Docker restart (start senyap, tanpa notif).');
+      process.exit(1);
+      return;
+    }
+    console.log('[polling] stop polling dgn abort (bukan cancel) + start ulang dlm 5s…');
+    const bersih = await stopPollingCleanly();
+    if (!bersih) console.error('[polling] peringatan: polling masih kebaca aktif waktu mau start ulang.');
+    await new Promise((r) => setTimeout(r, 5000));
+    try {
+      await bot.startPolling();
+      console.log('[polling] polling jalan lagi ✓');
+      pollRecoveryCount = 0;
+    } catch (e) {
+      console.error('[polling] startPolling gagal: ' + e.message);
+    }
+  } finally {
+    recoveringPoll = false;
+  }
+}
+
+// ─── 409 CONFLICT: token ini dipakai lebih dari satu poller ──────────────────
+const CONFLICT_WINDOW_MS = 10 * 60 * 1000;        // jendela hitung konflik
+const CONFLICT_MAX = 20;                          // > ini dlm jendela → restart bersih
+const CONFLICT_LOG_EVERY_MS = 30 * 1000;          // throttle log (dulu 283rb baris)
+const CLEAN_RESTART_COOLDOWN_MS = 20 * 60 * 1000; // anti restart-storm
+const CLEAN_RESTART_KEY = 'last_poll_clean_restart';
+let firstConflictAt = 0;
+let conflictCount = 0;
+let lastConflictLogAt = 0;
+
+function handleConflict(m) {
+  const now = Date.now();
+  if (now - firstConflictAt > CONFLICT_WINDOW_MS) {
+    firstConflictAt = now;
+    conflictCount = 0;
+    lastConflictLogAt = 0;
+  }
+  conflictCount++;
+  const shouldLog = now - lastConflictLogAt > CONFLICT_LOG_EVERY_MS;
+  if (shouldLog) {
+    lastConflictLogAt = now;
+    console.error('[polling] 409 CONFLICT (' + conflictCount + 'x/' + Math.round(CONFLICT_WINDOW_MS / 60000) + 'mnt) — token ini dipakai poller/instance lain: ' + m);
+    recordPollError('409 ' + m);
+  }
+  if (conflictCount < CONFLICT_MAX) return;
+
+  const sinceClean = now - (Date.parse(botStateGet(CLEAN_RESTART_KEY) || '') || 0);
+  if (sinceClean < CLEAN_RESTART_COOLDOWN_MS) {
+    if (shouldLog) {
+      console.error('[polling] 409 masih deras ' + Math.round(sinceClean / 1000) + 's setelah restart bersih — kemungkinan instance LAIN (di luar container ini) pakai token yang sama; nggak restart lagi biar nggak jadi storm.');
+    }
+    return;
+  }
+  console.error('[polling] 409 deras (' + conflictCount + 'x) → exit(1): Docker start proses bersih dgn 1 poller (senyap, tanpa notif).');
+  botStateSet(CLEAN_RESTART_KEY, new Date().toISOString());
+  process.exit(1);
+}
+
+bot.on('polling_error', (err) => {
+  const m = String((err && err.message) || err || '');
+  if (/409|Conflict/i.test(m)) { handleConflict(m); return; }
+  if (m.includes('EFATAL')) { recoverPolling(m); return; }
+  console.error('[polling_error]', m);
+  recordPollError('soft ' + m);
 });
 
 setTimeout(async () => {
+  const why = notifyRequested();
+  if (!why) {
+    console.log('[startup] mode SENYAP — notif online TIDAK dikirim (restart bukan dari kita / auto-restart Docker).');
+    return;
+  }
+  console.log('[startup] notif online dikirim (' + why + ').');
   for (const id of ADMIN_IDS) {
     await bot.sendMessage(id, '🟢 Sobat Product online.').catch(() => {});
   }

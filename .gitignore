@@ -7,3 +7,10 @@ __pycache__/
 *.log
 .DS_Store
 google-credentials.json
+
+# runtime state SQLite (volume-mounted ke container — JANGAN di-commit;
+# pernah ke-track dan bikin WAL 4MB nongkrong di git + rawan ke-revert git)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/notify-online
